@@ -7,6 +7,22 @@
  *       -lshlwapi -lncrypt -lwbemUuid -lole32 -loleaut32 -Wall
  *
  * Note: WMI (TPM info) requires COM/DCOM. Linked via ole32+oleaut32.
+ *
+ * UI Improvements v2:
+ *  - Status bar with 3 panels: message | key count | last refresh time
+ *  - Keyboard shortcuts: F5=Refresh, Ctrl+C=Copy, Ctrl+F=Focus search,
+ *                        Escape=Clear search, Ctrl+E=Expand all,
+ *                        Ctrl+W=Collapse all, Ctrl+S=Save baseline
+ *  - Search box cue banner ("Search keys…")
+ *  - Expand All / Collapse All buttons
+ *  - Word-wrap toggle for detail pane
+ *  - Detail pane font size +/- buttons
+ *  - Splitter highlights blue on hover/drag
+ *  - Tree item count shown in status bar after populate
+ *  - Last refresh timestamp in status bar
+ *  - Improved toolbar layout with visual separator
+ *  - Copy button copies full detail pane path (Ctrl+Shift+C)
+ *  - Window title shows "Key Viewer  [Admin]" when elevated
  */
 
 #define UNICODE
@@ -26,47 +42,62 @@
 #include <wchar.h>
 
 /* ── IDs ────────────────────────────────────────────────── */
-#define ID_TREEVIEW   1001
-#define ID_STATUSBAR  1002
-#define ID_REFRESH    1003
-#define ID_COPYKEY    1004
-#define ID_SEARCH     1005
-#define ID_DETAIL     1006
-#define ID_SPLITTER   1007
-#define ID_BASELINE   1008
+#define ID_TREEVIEW     1001
+#define ID_STATUSBAR    1002
+#define ID_REFRESH      1003
+#define ID_COPYKEY      1004
+#define ID_SEARCH       1005
+#define ID_DETAIL       1006
+#define ID_SPLITTER     1007
+#define ID_BASELINE     1008
+#define ID_EXPANDALL    1009
+#define ID_COLLAPSEALL  1010
+#define ID_WORDWRAP     1011
+#define ID_FONTPLUS     1012
+#define ID_FONTMINUS    1013
+
+/* ── Status bar panel indices ───────────────────────────── */
+#define SB_PANEL_MSG    0
+#define SB_PANEL_COUNT  1
+#define SB_PANEL_TIME   2
 
 /* ── Layout ─────────────────────────────────────────────── */
-#define TOOLBAR_H   38
-#define SPLITTER_W  5
-#define DETAIL_MIN  180
-#define DETAIL_DEF  320
+#define TOOLBAR_H       44
+#define SPLITTER_W      6
+#define DETAIL_MIN      180
+#define DETAIL_DEF      320
+#define BTN_H           28
+#define BTN_Y           8
 
 static HWND g_hTree    = NULL;
 static HWND g_hStatus  = NULL;
 static HWND g_hWnd     = NULL;
 static HWND g_hSearch  = NULL;
 static HWND g_hDetail  = NULL;
-static int  g_splitX   = 0;   /* pixels from right edge for detail pane */
+static HWND g_hSplitter= NULL;
+static int  g_splitX   = 0;
 static BOOL g_dragging = FALSE;
+static BOOL g_splitterHot = FALSE;
 
-/* ── PCR Baseline ───────────────────────────────────────────
-   SHA-256 bank only (24 PCRs × 32 bytes).
-   Loaded from disk on startup, compared against live values
-   on every Populate(). g_baselineValid = FALSE means no file
-   exists yet — auto-save on first successful PCR read.       */
+/* ── Detail pane state ──────────────────────────────────── */
+static int  g_detailFontSize = 14;
+static BOOL g_wordWrap       = FALSE;
+static HFONT g_detailFont    = NULL;
+
+/* ── PCR Baseline ───────────────────────────────────────── */
 #define PCR_COUNT 24
 #define PCR_HASH_LEN 32
 
 static BYTE g_baseline[PCR_COUNT][PCR_HASH_LEN] = {0};
-static BOOL g_baselineValid  = FALSE;  /* TRUE once loaded from disk */
-static BOOL g_baselineDirty  = FALSE;  /* TRUE if we need to save    */
+static BOOL g_baselineValid  = FALSE;
+static BOOL g_baselineDirty  = FALSE;
 
 static void GetBaselinePath(wchar_t *out, DWORD outChars)
 {
     wchar_t appData[MAX_PATH]={0};
     SHGetFolderPathW(NULL, CSIDL_APPDATA, NULL, 0, appData);
     swprintf_s(out, outChars, L"%s\\KeyViewer", appData);
-    CreateDirectoryW(out, NULL); /* no-op if exists */
+    CreateDirectoryW(out, NULL);
     swprintf_s(out, outChars, L"%s\\KeyViewer\\pcr_baseline.bin", appData);
 }
 
@@ -98,21 +129,168 @@ static void SaveBaseline(const BYTE src[PCR_COUNT][PCR_HASH_LEN])
 }
 
 /* ── Color-coded item data ──────────────────────────────── */
-#define COL_DEFAULT  0   /* black */
-#define COL_HARDWARE 1   /* blue  — hardware/TPM key */
-#define COL_WARN     2   /* orange — exportable private key */
-#define COL_GOOD     3   /* green  — secure boot enabled / non-exportable */
-#define COL_BAD      4   /* red    — secure boot disabled */
-#define COL_HEADER   5   /* dark grey — section headers */
+#define COL_DEFAULT  0
+#define COL_HARDWARE 1
+#define COL_WARN     2
+#define COL_GOOD     3
+#define COL_BAD      4
+#define COL_HEADER   5
 
 static COLORREF g_colors[] = {
-    RGB(20,  20,  20),   /* default */
-    RGB(0,   80,  200),  /* hardware */
-    RGB(200, 120, 0),    /* warn */
-    RGB(0,   140, 60),   /* good */
-    RGB(200, 40,  40),   /* bad */
-    RGB(80,  80,  80),   /* header */
+    RGB(20,  20,  20),
+    RGB(0,   80,  200),
+    RGB(200, 120, 0),
+    RGB(0,   140, 60),
+    RGB(200, 40,  40),
+    RGB(80,  80,  80),
 };
+
+/* ── Admin elevation check ──────────────────────────────── */
+static BOOL IsElevated(void)
+{
+    BOOL elevated = FALSE;
+    HANDLE hToken = NULL;
+    if(OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hToken)){
+        TOKEN_ELEVATION te;
+        DWORD cb = sizeof(te);
+        if(GetTokenInformation(hToken, TokenElevation, &te, sizeof(te), &cb))
+            elevated = te.TokenIsElevated;
+        CloseHandle(hToken);
+    }
+    return elevated;
+}
+
+/* ── Update window title with elevation indicator ────────── */
+static void UpdateWindowTitle(void)
+{
+    wchar_t title[128];
+    if(IsElevated())
+        wcscpy_s(title, 128, L"Key Viewer  \u26A1 [Administrator]");
+    else
+        wcscpy_s(title, 128, L"Key Viewer  (run as Admin for full data)");
+    SetWindowTextW(g_hWnd, title);
+}
+
+/* ── Status bar helpers ─────────────────────────────────── */
+static void SetStatusMsg(const wchar_t *msg)
+{
+    SendMessage(g_hStatus, SB_SETTEXT, SB_PANEL_MSG, (LPARAM)msg);
+}
+
+static void SetStatusCount(int count)
+{
+    wchar_t buf[64];
+    swprintf_s(buf, 63, L"%d items", count);
+    SendMessage(g_hStatus, SB_SETTEXT, SB_PANEL_COUNT, (LPARAM)buf);
+}
+
+static void SetStatusTime(void)
+{
+    SYSTEMTIME st; GetLocalTime(&st);
+    wchar_t buf[64];
+    swprintf_s(buf, 63, L"Refreshed %02d:%02d:%02d",
+               st.wHour, st.wMinute, st.wSecond);
+    SendMessage(g_hStatus, SB_SETTEXT, SB_PANEL_TIME, (LPARAM)buf);
+}
+
+/* ── Count all tree items ───────────────────────────────── */
+static int CountTreeItems(void)
+{
+    int count = 0;
+    HTREEITEM h = TreeView_GetRoot(g_hTree);
+    typedef struct { HTREEITEM h; } Frame;
+    Frame stack[1024]; int top = 0;
+    if(h){ stack[top++].h = h; }
+    while(top > 0){
+        Frame f = stack[--top];
+        count++;
+        HTREEITEM sib = TreeView_GetNextSibling(g_hTree, f.h);
+        if(sib && top < 1023) stack[top++].h = sib;
+        HTREEITEM ch = TreeView_GetChild(g_hTree, f.h);
+        if(ch && top < 1023) stack[top++].h = ch;
+    }
+    return count;
+}
+
+/* ── Expand/Collapse all tree items ─────────────────────── */
+static void TreeExpandAll(HWND hTree, HTREEITEM hItem, UINT code)
+{
+    if(!hItem) return;
+    SendMessage(hTree, TVM_EXPAND, code, (LPARAM)hItem);
+    HTREEITEM ch = TreeView_GetChild(hTree, hItem);
+    while(ch){
+        TreeExpandAll(hTree, ch, code);
+        ch = TreeView_GetNextSibling(hTree, ch);
+    }
+}
+
+static void DoExpandAll(void)
+{
+    HTREEITEM root = TreeView_GetRoot(g_hTree);
+    SendMessage(g_hTree, WM_SETREDRAW, FALSE, 0);
+    TreeExpandAll(g_hTree, root, TVE_EXPAND);
+    SendMessage(g_hTree, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(g_hTree, NULL, TRUE);
+    SetStatusMsg(L"Expanded all nodes");
+}
+
+static void DoCollapseAll(void)
+{
+    HTREEITEM root = TreeView_GetRoot(g_hTree);
+    SendMessage(g_hTree, WM_SETREDRAW, FALSE, 0);
+    TreeExpandAll(g_hTree, root, TVE_COLLAPSE);
+    /* Re-expand just the root */
+    SendMessage(g_hTree, TVM_EXPAND, TVE_EXPAND, (LPARAM)root);
+    SendMessage(g_hTree, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(g_hTree, NULL, TRUE);
+    SetStatusMsg(L"Collapsed all nodes");
+}
+
+/* ── Rebuild detail pane font ────────────────────────────── */
+static void RebuildDetailFont(void)
+{
+    if(g_detailFont) DeleteObject(g_detailFont);
+    g_detailFont = CreateFontW(
+        g_detailFontSize, 0, 0, 0, FW_NORMAL,
+        FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+        CLEARTYPE_QUALITY, FIXED_PITCH, L"Consolas");
+    SendMessage(g_hDetail, WM_SETFONT, (WPARAM)g_detailFont, TRUE);
+}
+
+/* ── Toggle word wrap in detail pane ────────────────────── */
+static void ToggleWordWrap(void)
+{
+    g_wordWrap = !g_wordWrap;
+
+    /* Save current text */
+    int len = GetWindowTextLengthW(g_hDetail) + 1;
+    wchar_t *txt = (wchar_t*)malloc(len * sizeof(wchar_t));
+    if(txt) GetWindowTextW(g_hDetail, txt, len);
+
+    RECT rc; GetWindowRect(g_hDetail, &rc);
+    POINT tl = {rc.left, rc.top}; ScreenToClient(g_hWnd, &tl);
+    int w = rc.right - rc.left, h = rc.bottom - rc.top;
+
+    DestroyWindow(g_hDetail);
+
+    DWORD style = WS_CHILD|WS_VISIBLE|WS_VSCROLL|
+                  ES_MULTILINE|ES_READONLY|ES_AUTOVSCROLL;
+    if(!g_wordWrap) style |= WS_HSCROLL|ES_AUTOHSCROLL;
+
+    g_hDetail = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+        style, tl.x, tl.y, w, h,
+        g_hWnd, (HMENU)ID_DETAIL, NULL, NULL);
+
+    RebuildDetailFont();
+    if(txt){ SetWindowTextW(g_hDetail, txt); free(txt); }
+
+    /* Update button text */
+    HWND hBtn = GetDlgItem(g_hWnd, ID_WORDWRAP);
+    SetWindowTextW(hBtn, g_wordWrap ? L"Wrap \u2713" : L"Wrap");
+
+    SetStatusMsg(g_wordWrap ? L"Word wrap ON" : L"Word wrap OFF");
+}
 
 /* ── TreeView helper ─────────────────────────────────────── */
 static HTREEITEM AddItem(HWND hTree, HTREEITEM hParent,
@@ -182,16 +360,14 @@ static void LoadSecureBoot(HTREEITEM hRoot)
 {
     HTREEITEM hSB = ADD(hRoot, L"Secure Boot", 0, COL_HEADER);
 
-    /* State */
     DWORD state = RegGetDW(HKEY_LOCAL_MACHINE,
         L"SYSTEM\\CurrentControlSet\\Control\\SecureBoot\\State",
         L"UEFISecureBootEnabled");
     ADD(hSB,
-        state ? L"Status: ENABLED  ✔" : L"Status: DISABLED  ✘",
+        state ? L"Status: ENABLED  \u2714" : L"Status: DISABLED  \u2718",
         state ? 3 : 2,
         state ? COL_GOOD : COL_BAD);
 
-    /* Setup mode */
     DWORD setup = RegGetDW(HKEY_LOCAL_MACHINE,
         L"SYSTEM\\CurrentControlSet\\Control\\SecureBoot\\State",
         L"SetupMode");
@@ -199,7 +375,6 @@ static void LoadSecureBoot(HTREEITEM hRoot)
         setup ? L"Setup Mode: YES (no PK enrolled)" : L"Setup Mode: NO",
         2, setup ? COL_WARN : COL_DEFAULT);
 
-    /* Policy */
     wchar_t policy[64]={0};
     if(RegGetStr(HKEY_LOCAL_MACHINE,
         L"SYSTEM\\CurrentControlSet\\Control\\SecureBoot\\State",
@@ -257,7 +432,7 @@ static void LoadSecureBoot(HTREEITEM hRoot)
                 swprintf_s(lbl,127,L"%s: (not present on this firmware)",
                            vars[v].label);
             else
-                swprintf_s(lbl,127,L"%s: (not accessible — err %08X)",
+                swprintf_s(lbl,127,L"%s: (not accessible \u2014 err %08X)",
                            vars[v].label, err);
             ADD(hVars, lbl, 2, COL_DEFAULT);
             free(buf); buf=NULL;
@@ -322,7 +497,7 @@ static void LoadSecureBoot(HTREEITEM hRoot)
                             FileTimeToSystemTime(&pCert->pCertInfo->NotBefore,&nb);
                             FileTimeToSystemTime(&pCert->pCertInfo->NotAfter,&na);
                             swprintf_s(cl,511,
-                                L"Valid: %04d-%02d-%02d → %04d-%02d-%02d",
+                                L"Valid: %04d-%02d-%02d \u2192 %04d-%02d-%02d",
                                 nb.wYear,nb.wMonth,nb.wDay,
                                 na.wYear,na.wMonth,na.wDay);
                             ADD(hSig,cl,2,COL_DEFAULT);
@@ -345,7 +520,7 @@ static void LoadSecureBoot(HTREEITEM hRoot)
             rem -= listSize;
         }
         if(sigCount==0)
-            ADD(hV, L"(could not parse entries — may need admin)", 2, COL_WARN);
+            ADD(hV, L"(could not parse entries \u2014 may need admin)", 2, COL_WARN);
         SendMessage(g_hTree,TVM_EXPAND,TVE_EXPAND,(LPARAM)hV);
         free(buf); buf=NULL;
     }
@@ -390,10 +565,6 @@ static BOOL WmiGetBool(IWbemClassObject *obj, const wchar_t *prop)
 /* ═══════════════════════════════════════════════════════════
    EK CERTIFICATE  (probe multiple NV indices)
    ══════════════════════════════════════════════════════════ */
-
-/* Helper: attempt NV_ReadPublic on one index.
-   Returns the nvDataSize on success, 0 if index absent, -1 on other error.
-   Fills rspBuf/rspBufSz with the raw ReadPublic response for attribute display. */
 static int NvReadPublicSize(void *hCtx,
                              UINT32 (WINAPI *fnSubmit)(void*,UINT32,UINT32,
                                                         const BYTE*,UINT32,
@@ -404,7 +575,7 @@ static int NvReadPublicSize(void *hCtx,
     BYTE cmd[14];
     cmd[0]=0x80; cmd[1]=0x01;
     cmd[2]=0x00; cmd[3]=0x00; cmd[4]=0x00; cmd[5]=0x0E;
-    cmd[6]=0x00; cmd[7]=0x00; cmd[8]=0x01; cmd[9]=0x69; /* NV_ReadPublic */
+    cmd[6]=0x00; cmd[7]=0x00; cmd[8]=0x01; cmd[9]=0x69;
     cmd[10]=(BYTE)(nvIndex>>24); cmd[11]=(BYTE)(nvIndex>>16);
     cmd[12]=(BYTE)(nvIndex>>8);  cmd[13]=(BYTE)(nvIndex);
 
@@ -415,11 +586,9 @@ static int NvReadPublicSize(void *hCtx,
     UINT32 respCode = ((UINT32)rspBuf[6]<<24)|((UINT32)rspBuf[7]<<16)|
                      ((UINT32)rspBuf[8]<<8)|rspBuf[9];
 
-    /* 0x8B = TPM_RC_HANDLE, 0x14B = TPM_RC_NV_UNDEFINED — index just not there */
     if(respCode == 0x0000008B || respCode == 0x0000014B) return 0;
     if(respCode != 0) return -1;
 
-    /* Parse TPMS_NV_PUBLIC to extract dataSize */
     if(rspSize < 10 + 2 + 12) return -1;
     DWORD off = 10;
     WORD nvPublicSize = ((WORD)rspBuf[off]<<8)|rspBuf[off+1]; off += 2;
@@ -432,9 +601,6 @@ static int NvReadPublicSize(void *hCtx,
     return (int)dataSize;
 }
 
-/* Helper: read nvDataSize bytes from nvIndex via chunked NV_Read.
-   Returns allocated buffer (caller frees) or NULL on failure.
-   certTotal is set to actual bytes read.                          */
 static BYTE *NvReadAll(void *hCtx,
                         UINT32 (WINAPI *fnSubmit)(void*,UINT32,UINT32,
                                                    const BYTE*,UINT32,
@@ -452,28 +618,17 @@ static BYTE *NvReadAll(void *hCtx,
         if(chunkSize > 1024) chunkSize = 1024;
         WORD offset = (WORD)*certTotal;
 
-        /* NV_Read command: tag=0x8002 (sessions), CC=0x0000014E
-           handles: authHandle=nvIndex, nvIndex=nvIndex
-           authArea(4 bytes size + 9 bytes): TPM_RS_PW, empty nonce, empty hmac
-           params: size(2) + offset(2)
-           Total = 2+4+4+4+4+4+9+2+2 = 35 bytes                             */
         BYTE cmd[35];
-        cmd[0]=0x80; cmd[1]=0x02;                         /* TPM_ST_SESSIONS */
-        cmd[2]=0x00; cmd[3]=0x00; cmd[4]=0x00; cmd[5]=0x23; /* size=35 */
-        cmd[6]=0x00; cmd[7]=0x00; cmd[8]=0x01; cmd[9]=0x4E; /* NV_Read */
-        /* authHandle = nvIndex */
+        cmd[0]=0x80; cmd[1]=0x02;
+        cmd[2]=0x00; cmd[3]=0x00; cmd[4]=0x00; cmd[5]=0x23;
+        cmd[6]=0x00; cmd[7]=0x00; cmd[8]=0x01; cmd[9]=0x4E;
         cmd[10]=(BYTE)(nvIndex>>24); cmd[11]=(BYTE)(nvIndex>>16);
         cmd[12]=(BYTE)(nvIndex>>8);  cmd[13]=(BYTE)(nvIndex);
-        /* nvIndex */
         cmd[14]=(BYTE)(nvIndex>>24); cmd[15]=(BYTE)(nvIndex>>16);
         cmd[16]=(BYTE)(nvIndex>>8);  cmd[17]=(BYTE)(nvIndex);
-        /* authArea size = 9 */
         cmd[18]=0x00; cmd[19]=0x00; cmd[20]=0x00; cmd[21]=0x09;
-        /* TPM_RS_PW = 0x40000009 */
         cmd[22]=0x40; cmd[23]=0x00; cmd[24]=0x00; cmd[25]=0x09;
-        /* nonceSize=0, sessionAttr=0, hmacSize=0 */
         cmd[26]=0x00; cmd[27]=0x00; cmd[28]=0x00; cmd[29]=0x00; cmd[30]=0x00;
-        /* size(2) + offset(2) */
         cmd[31]=(BYTE)(chunkSize>>8); cmd[32]=(BYTE)(chunkSize);
         cmd[33]=(BYTE)(offset>>8);    cmd[34]=(BYTE)(offset);
 
@@ -487,12 +642,11 @@ static BYTE *NvReadAll(void *hCtx,
         if(respCode != 0){
             free(buf);
             swprintf_s(errOut,errLen,
-                L"(NV_Read @offset %u failed: TPM rc=0x%08X — run as Administrator)",
+                L"(NV_Read @offset %u failed: TPM rc=0x%08X \u2014 run as Administrator)",
                 offset, respCode);
             return NULL;
         }
 
-        /* Response: header(10) + paramSize(4) + TPM2B size(2) + data */
         if(rspSize < 10+4+2){ free(buf); swprintf_s(errOut,errLen,L"(response too short)"); return NULL; }
         DWORD roff = 10+4;
         WORD got = ((WORD)rsp[roff]<<8)|rsp[roff+1]; roff+=2;
@@ -505,14 +659,12 @@ static BYTE *NvReadAll(void *hCtx,
     return buf;
 }
 
-/* Helper: parse and display a DER cert blob under hParent */
 static void DisplayCertDer(HTREEITEM hParent, const BYTE *der, DWORD derLen)
 {
     PCCERT_CONTEXT pCert = CertCreateCertificateContext(
         X509_ASN_ENCODING|PKCS_7_ASN_ENCODING, der, derLen);
 
     if(!pCert && derLen > 2){
-        /* Some firmware prepends a 2-byte big-endian length — strip and retry */
         WORD skip = ((WORD)der[0]<<8)|der[1];
         if(skip > 0 && (DWORD)skip+2 <= derLen)
             pCert = CertCreateCertificateContext(
@@ -531,24 +683,20 @@ static void DisplayCertDer(HTREEITEM hParent, const BYTE *der, DWORD derLen)
 
     wchar_t lbl[512];
 
-    /* Subject */
     wchar_t subj[256]=L"(unknown)";
     CertGetNameStringW(pCert,CERT_NAME_SIMPLE_DISPLAY_TYPE,0,NULL,subj,255);
     swprintf_s(lbl,511,L"Subject: %s",subj);
     ADD(hParent,lbl,1,COL_HARDWARE);
 
-    /* Issuer */
     wchar_t iss[256]=L"(unknown)";
     CertGetNameStringW(pCert,CERT_NAME_SIMPLE_DISPLAY_TYPE,CERT_NAME_ISSUER_FLAG,NULL,iss,255);
     swprintf_s(lbl,511,L"Issuer: %s",iss);
     ADD(hParent,lbl,2,COL_DEFAULT);
 
-    /* Full subject DN */
     wchar_t dn[512]=L"";
     CertGetNameStringW(pCert,CERT_NAME_RDN_TYPE,0,NULL,dn,511);
     if(dn[0]){ swprintf_s(lbl,511,L"Subject DN: %s",dn); ADD(hParent,lbl,2,COL_DEFAULT); }
 
-    /* Serial (little-endian in CryptoAPI → reverse) */
     {
         DWORD snLen = pCert->pCertInfo->SerialNumber.cbData;
         if(snLen>0 && snLen<=32){
@@ -561,17 +709,15 @@ static void DisplayCertDer(HTREEITEM hParent, const BYTE *der, DWORD derLen)
         }
     }
 
-    /* Validity */
     {
         SYSTEMTIME nb,na;
         FileTimeToSystemTime(&pCert->pCertInfo->NotBefore,&nb);
         FileTimeToSystemTime(&pCert->pCertInfo->NotAfter,&na);
-        swprintf_s(lbl,511,L"Valid: %04d-%02d-%02d → %04d-%02d-%02d",
+        swprintf_s(lbl,511,L"Valid: %04d-%02d-%02d \u2192 %04d-%02d-%02d",
             nb.wYear,nb.wMonth,nb.wDay,na.wYear,na.wMonth,na.wDay);
         ADD(hParent,lbl,2,COL_DEFAULT);
     }
 
-    /* SHA-1 thumbprint */
     {
         BYTE th[20]; DWORD tsz=20;
         if(CryptHashCertificate(0,CALG_SHA1,0,
@@ -583,7 +729,6 @@ static void DisplayCertDer(HTREEITEM hParent, const BYTE *der, DWORD derLen)
         }
     }
 
-    /* Public key algorithm + bit length */
     {
         wchar_t pkAlg[128]=L"";
         if(pCert->pCertInfo->SubjectPublicKeyInfo.Algorithm.pszObjId)
@@ -614,7 +759,6 @@ static void DisplayCertDer(HTREEITEM hParent, const BYTE *der, DWORD derLen)
         ADD(hParent,lbl,1,COL_HARDWARE);
     }
 
-    /* Key usage */
     {
         BYTE ku=0;
         if(CertGetIntendedKeyUsage(X509_ASN_ENCODING,pCert->pCertInfo,&ku,1)){
@@ -626,11 +770,10 @@ static void DisplayCertDer(HTREEITEM hParent, const BYTE *der, DWORD derLen)
         }
     }
 
-    /* TCG EK OID 2.23.133.8.1 */
     if(CertFindExtension("2.23.133.8.1",
                           pCert->pCertInfo->cExtension,
                           pCert->pCertInfo->rgExtension))
-        ADD(hParent,L"TCG EK Certificate  ✔  (OID 2.23.133.8.1 present)",3,COL_GOOD);
+        ADD(hParent,L"TCG EK Certificate  \u2714  (OID 2.23.133.8.1 present)",3,COL_GOOD);
 
     CertFreeCertificateContext(pCert);
 }
@@ -643,16 +786,15 @@ static void LoadEKCert(HTREEITEM hTPM,
 {
     HTREEITEM hEKRoot = ADD(hTPM, L"EK Certificates  (Endorsement Key)", 0, COL_HEADER);
 
-    /* All known EK NV indices — probe each silently */
     static const struct {
         DWORD         index;
         const wchar_t *label;
     } indices[] = {
-        { 0x01C00002, L"RSA-2048 EK cert  (NV 0x01C00002 — TCG standard)" },
-        { 0x01C00012, L"ECC P-256 EK cert  (NV 0x01C00012 — TCG standard)" },
-        { 0x01C00014, L"ECC P-384 EK cert  (NV 0x01C00014 — TCG standard)" },
-        { 0x01C0000A, L"EK cert  (NV 0x01C0000A — vendor alternate)"       },
-        { 0x01C00016, L"ECC P-521 EK cert  (NV 0x01C00016 — TCG standard)" },
+        { 0x01C00002, L"RSA-2048 EK cert  (NV 0x01C00002 \u2014 TCG standard)" },
+        { 0x01C00012, L"ECC P-256 EK cert  (NV 0x01C00012 \u2014 TCG standard)" },
+        { 0x01C00014, L"ECC P-384 EK cert  (NV 0x01C00014 \u2014 TCG standard)" },
+        { 0x01C0000A, L"EK cert  (NV 0x01C0000A \u2014 vendor alternate)"       },
+        { 0x01C00016, L"ECC P-521 EK cert  (NV 0x01C00016 \u2014 TCG standard)" },
     };
 
     BOOL anyFound = FALSE;
@@ -663,17 +805,15 @@ static void LoadEKCert(HTREEITEM hTPM,
         int dataSize = NvReadPublicSize(hCtx, fnSubmit,
                                          indices[i].index,
                                          rspBuf, sizeof(rspBuf));
-        if(dataSize == 0) continue;  /* index absent — skip silently */
+        if(dataSize == 0) continue;
         if(dataSize < 0){
-            /* present but unreadable — still show it */
             wchar_t errLbl[256];
-            swprintf_s(errLbl,255,L"%s  ⚠ (ReadPublic error)",indices[i].label);
+            swprintf_s(errLbl,255,L"%s  \u26A0 (ReadPublic error)",indices[i].label);
             ADD(hEKRoot,errLbl,2,COL_WARN);
             anyFound=TRUE;
             continue;
         }
 
-        /* Create a node for this index */
         HTREEITEM hEK = ADD(hEKRoot, indices[i].label, 1, COL_HARDWARE);
         anyFound = TRUE;
 
@@ -704,12 +844,6 @@ static void LoadEKCert(HTREEITEM hTPM,
             L"No EK certs found in NV  (AMD fTPM often doesn't provision them)",
             2, COL_WARN);
 
-    /* ── Derive EK public key via TPM2_CC_CreatePrimary ──────────────────
-       The EK keypair is deterministically derived from the TPM seed every
-       time using the standard TCG EK template — same key, no cert needed.
-
-       Well-known EK authPolicy = SHA-256 of PolicySecret(endorsement):
-         837197674484b3f81a90cc8d46a5d724fd52d76e06520b64f2a1da1b331469aa  */
     {
         HTREEITEM hDerived = ADD(hEKRoot,
             L"Derived EK Public Key  (TPM2_CC_CreatePrimary, RSA-2048)",
@@ -722,58 +856,45 @@ static void LoadEKCert(HTREEITEM hTPM,
             0xf2,0xa1,0xda,0x1b,0x33,0x14,0x69,0xaa
         };
 
-        /* Build TPMT_PUBLIC for default RSA-2048 EK template */
         BYTE tpmtPublic[320]; DWORD pp = 0;
-        tpmtPublic[pp++]=0x00; tpmtPublic[pp++]=0x01; /* type = RSA */
-        tpmtPublic[pp++]=0x00; tpmtPublic[pp++]=0x0B; /* nameAlg = SHA-256 */
-        /* objectAttributes = fixedTPM|fixedParent|sensDataOrigin|adminWithPolicy|restricted|decrypt */
+        tpmtPublic[pp++]=0x00; tpmtPublic[pp++]=0x01;
+        tpmtPublic[pp++]=0x00; tpmtPublic[pp++]=0x0B;
         tpmtPublic[pp++]=0x00; tpmtPublic[pp++]=0x03;
         tpmtPublic[pp++]=0x00; tpmtPublic[pp++]=0x72;
-        /* authPolicy TPM2B */
         tpmtPublic[pp++]=0x00; tpmtPublic[pp++]=0x20;
         memcpy(tpmtPublic+pp,ekPolicy,32); pp+=32;
-        /* TPMS_RSA_PARMS: AES-128-CFB symmetric */
-        tpmtPublic[pp++]=0x00; tpmtPublic[pp++]=0x06; /* TPM_ALG_AES */
-        tpmtPublic[pp++]=0x00; tpmtPublic[pp++]=0x80; /* 128 bits */
-        tpmtPublic[pp++]=0x00; tpmtPublic[pp++]=0x43; /* TPM_ALG_CFB */
-        tpmtPublic[pp++]=0x00; tpmtPublic[pp++]=0x10; /* scheme = NULL */
-        tpmtPublic[pp++]=0x08; tpmtPublic[pp++]=0x00; /* keyBits = 2048 */
-        tpmtPublic[pp++]=0x00; tpmtPublic[pp++]=0x00; /* exponent = 0 -> 65537 */
+        tpmtPublic[pp++]=0x00; tpmtPublic[pp++]=0x06;
+        tpmtPublic[pp++]=0x00; tpmtPublic[pp++]=0x80;
+        tpmtPublic[pp++]=0x00; tpmtPublic[pp++]=0x43;
+        tpmtPublic[pp++]=0x00; tpmtPublic[pp++]=0x10;
+        tpmtPublic[pp++]=0x08; tpmtPublic[pp++]=0x00;
         tpmtPublic[pp++]=0x00; tpmtPublic[pp++]=0x00;
-        /* unique TPM2B_PUBLIC_KEY_RSA: 256 zero bytes */
+        tpmtPublic[pp++]=0x00; tpmtPublic[pp++]=0x00;
         tpmtPublic[pp++]=0x01; tpmtPublic[pp++]=0x00;
         memset(tpmtPublic+pp,0,256); pp+=256;
-        DWORD tpmtLen = pp; /* 318 */
+        DWORD tpmtLen = pp;
 
-        /* CreatePrimary command total size:
-           header(10)+authHandle(4)+authAreaSize(4)+authArea(9)+
-           inSensitive(6)+inPublicSize(2)+inPublic(tpmtLen)+
-           outsideInfo(2)+creationPCR(4) = 41+tpmtLen */
         DWORD cmdLen = 41 + tpmtLen;
         BYTE *cmd = (BYTE*)calloc(cmdLen,1);
         if(!cmd){ ADD(hDerived,L"(out of memory)",2,COL_WARN); goto doneEK; }
 
         DWORD cp = 0;
-        cmd[cp++]=0x80; cmd[cp++]=0x02; /* TPM_ST_SESSIONS */
+        cmd[cp++]=0x80; cmd[cp++]=0x02;
         cmd[cp++]=(BYTE)(cmdLen>>24); cmd[cp++]=(BYTE)(cmdLen>>16);
         cmd[cp++]=(BYTE)(cmdLen>>8);  cmd[cp++]=(BYTE)(cmdLen);
-        cmd[cp++]=0x00; cmd[cp++]=0x00; cmd[cp++]=0x01; cmd[cp++]=0x31; /* CC_CreatePrimary */
-        cmd[cp++]=0x40; cmd[cp++]=0x00; cmd[cp++]=0x00; cmd[cp++]=0x0B; /* TPM_RH_ENDORSEMENT */
-        cmd[cp++]=0x00; cmd[cp++]=0x00; cmd[cp++]=0x00; cmd[cp++]=0x09; /* authArea size=9 */
-        cmd[cp++]=0x40; cmd[cp++]=0x00; cmd[cp++]=0x00; cmd[cp++]=0x09; /* TPM_RS_PW */
-        cmd[cp++]=0x00; cmd[cp++]=0x00; /* nonce size=0 */
-        cmd[cp++]=0x00;                  /* sessionAttr=0 */
-        cmd[cp++]=0x00; cmd[cp++]=0x00; /* hmac size=0 */
-        /* inSensitive: outer TPM2B size=4, userAuth size=0, data size=0 */
+        cmd[cp++]=0x00; cmd[cp++]=0x00; cmd[cp++]=0x01; cmd[cp++]=0x31;
+        cmd[cp++]=0x40; cmd[cp++]=0x00; cmd[cp++]=0x00; cmd[cp++]=0x0B;
+        cmd[cp++]=0x00; cmd[cp++]=0x00; cmd[cp++]=0x00; cmd[cp++]=0x09;
+        cmd[cp++]=0x40; cmd[cp++]=0x00; cmd[cp++]=0x00; cmd[cp++]=0x09;
+        cmd[cp++]=0x00; cmd[cp++]=0x00;
+        cmd[cp++]=0x00;
+        cmd[cp++]=0x00; cmd[cp++]=0x00;
         cmd[cp++]=0x00; cmd[cp++]=0x04;
         cmd[cp++]=0x00; cmd[cp++]=0x00;
         cmd[cp++]=0x00; cmd[cp++]=0x00;
-        /* inPublic TPM2B */
         cmd[cp++]=(BYTE)(tpmtLen>>8); cmd[cp++]=(BYTE)(tpmtLen);
         memcpy(cmd+cp,tpmtPublic,tpmtLen); cp+=tpmtLen;
-        /* outsideInfo size=0 */
         cmd[cp++]=0x00; cmd[cp++]=0x00;
-        /* creationPCR count=0 */
         cmd[cp++]=0x00; cmd[cp++]=0x00; cmd[cp++]=0x00; cmd[cp++]=0x00;
 
         BYTE *rsp = (BYTE*)calloc(8192,1);
@@ -789,14 +910,13 @@ static void LoadEKCert(HTREEITEM hTPM,
                          ((UINT32)rsp[8]<<8)|rsp[9];
         if(respCode!=0){
             wchar_t lbl[128];
-            swprintf_s(lbl,127,L"(CreatePrimary TPM rc=0x%08X — run as Administrator)",respCode);
+            swprintf_s(lbl,127,L"(CreatePrimary TPM rc=0x%08X \u2014 run as Administrator)",respCode);
             ADD(hDerived,lbl,2,COL_WARN);
             free(rsp); goto doneEK;
         }
 
-        /* Response: header(10)+objectHandle(4)+paramSize(4)+outPublic TPM2B(2+N)+... */
         if(rspSize < 20){ free(rsp); ADD(hDerived,L"(response too short)",2,COL_WARN); goto doneEK; }
-        DWORD roff = 18; /* skip header+objectHandle+paramSize */
+        DWORD roff = 18;
         WORD outPublicSize = ((WORD)rsp[roff]<<8)|rsp[roff+1]; roff+=2;
         if(outPublicSize==0||roff+outPublicSize>rspSize){
             free(rsp); ADD(hDerived,L"(outPublic size invalid)",2,COL_WARN); goto doneEK;
@@ -804,7 +924,6 @@ static void LoadEKCert(HTREEITEM hTPM,
 
         BYTE *pub = rsp+roff;
 
-        /* Parse TPMT_PUBLIC */
         WORD pubType    = ((WORD)pub[0]<<8)|pub[1];
         WORD pubNameAlg = ((WORD)pub[2]<<8)|pub[3];
         DWORD pubAttr   = ((DWORD)pub[4]<<24)|((DWORD)pub[5]<<16)|
@@ -818,7 +937,6 @@ static void LoadEKCert(HTREEITEM hTPM,
             pubNameAlg==0x000B?L"SHA-256":pubNameAlg==0x0004?L"SHA-1":L"?");
         ADD(hDerived,lbl,2,COL_DEFAULT);
 
-        /* objectAttributes */
         {
             wchar_t a[256]=L"Attributes:";
             if(pubAttr&0x00000002) wcscat(a,L" fixedTPM");
@@ -832,18 +950,11 @@ static void LoadEKCert(HTREEITEM hTPM,
             ADD(hDerived,a,2,COL_DEFAULT);
         }
 
-        /* Skip authPolicy to get to parms+unique */
         DWORD pp2 = 8;
         if(pp2+2 > outPublicSize){ free(rsp); goto doneEK; }
         WORD apSize = ((WORD)pub[pp2]<<8)|pub[pp2+1]; pp2+=2+apSize;
 
-        if(pubType==0x0001){ /* RSA */
-            /* TPMS_RSA_PARMS layout (confirmed from raw bytes):
-                 sym alg(2) + sym keyBits(2) + sym mode(2) = 6
-                 scheme alg(2)                              = 2
-                 keyBits(2)                                 @ pp2+8
-                 exponent(4)                                @ pp2+10
-               Total = 14 bytes                                      */
+        if(pubType==0x0001){
             if(pp2+14 > outPublicSize){ free(rsp); goto doneEK; }
             WORD keyBits   = ((WORD)pub[pp2+8]<<8)|pub[pp2+9];
             DWORD exponent = ((DWORD)pub[pp2+10]<<24)|((DWORD)pub[pp2+11]<<16)|
@@ -852,9 +963,8 @@ static void LoadEKCert(HTREEITEM hTPM,
             ADD(hDerived,lbl,1,COL_HARDWARE);
             swprintf_s(lbl,511,L"Public exponent: %u",exponent==0?65537:exponent);
             ADD(hDerived,lbl,2,COL_DEFAULT);
-            pp2+=14; /* skip TPMS_RSA_PARMS: sym(6)+scheme(2)+keyBits(2)+exponent(4) */
+            pp2+=14;
 
-            /* unique TPM2B_PUBLIC_KEY_RSA */
             if(pp2+2 > outPublicSize){ free(rsp); goto doneEK; }
             WORD modSize = ((WORD)pub[pp2]<<8)|pub[pp2+1]; pp2+=2;
             if(pp2+modSize > outPublicSize){ free(rsp); goto doneEK; }
@@ -863,7 +973,6 @@ static void LoadEKCert(HTREEITEM hTPM,
             swprintf_s(lbl,511,L"Modulus (%u bytes):",modSize);
             HTREEITEM hMod = ADD(hDerived,lbl,1,COL_HARDWARE);
 
-            /* Modulus in 32-byte rows */
             for(WORD row=0; row<modSize; row+=32){
                 WORD rowLen = (modSize-row<32)?(WORD)(modSize-row):32;
                 wchar_t hexRow[100]={0};
@@ -873,7 +982,6 @@ static void LoadEKCert(HTREEITEM hTPM,
             }
             SendMessage(g_hTree,TVM_EXPAND,TVE_EXPAND,(LPARAM)hMod);
 
-            /* SHA-256 fingerprint of modulus = unique EK identity */
             {
                 HCRYPTPROV hProv3=0; HCRYPTHASH hHash=0;
                 if(CryptAcquireContextW(&hProv3,NULL,NULL,PROV_RSA_AES,CRYPT_VERIFYCONTEXT)){
@@ -886,7 +994,7 @@ static void LoadEKCert(HTREEITEM hTPM,
                             swprintf_s(lbl,511,L"Modulus SHA-256: %s",hex);
                             ADD(hDerived,lbl,1,COL_HARDWARE);
                             ADD(hDerived,
-                                L"↑ This fingerprint uniquely identifies your TPM chip  ✔",
+                                L"\u2191 This fingerprint uniquely identifies your TPM chip  \u2714",
                                 2,COL_GOOD);
                         }
                         CryptDestroyHash(hHash);
@@ -952,16 +1060,16 @@ static void LoadTPM(HTREEITEM hRoot)
             BOOL actuallyPresent = present || enabled || activated || owned || tbsPresent;
             ADD(hTPM,
                 tbsPresent && !present
-                    ? L"Present: YES  ✔  (WMI IsPresent bug — confirmed via TBS)"
+                    ? L"Present: YES  \u2714  (WMI IsPresent bug \u2014 confirmed via TBS)"
                     : actuallyPresent
-                    ? L"Present: YES  ✔"
-                    : L"Present: NO  ✘",
+                    ? L"Present: YES  \u2714"
+                    : L"Present: NO  \u2718",
                 actuallyPresent?3:2, actuallyPresent?COL_GOOD:COL_BAD);
             ADD(hTPM,
-                enabled ? L"Enabled: YES  ✔" : L"Enabled: NO  ✘",
+                enabled ? L"Enabled: YES  \u2714" : L"Enabled: NO  \u2718",
                 enabled?3:2, enabled?COL_GOOD:COL_BAD);
             ADD(hTPM,
-                activated ? L"Activated: YES  ✔" : L"Activated: NO  ✘",
+                activated ? L"Activated: YES  \u2714" : L"Activated: NO  \u2718",
                 activated?3:2, activated?COL_GOOD:COL_BAD);
             ADD(hTPM,
                 owned ? L"Owned: YES" : L"Owned: NO  (no EK)",
@@ -985,7 +1093,6 @@ static void LoadTPM(HTREEITEM hRoot)
                                             0,&vid,NULL,NULL))){
                 if(vid.vt==VT_I4||vid.vt==VT_UI4){
                     DWORD id=(DWORD)vid.lVal;
-                    /* Pack printable ASCII bytes only — skip nulls (e.g. "AMD\0") */
                     wchar_t mfrChars[8]={0}; DWORD mci=0;
                     BYTE mb[4]={(BYTE)((id>>24)&0xFF),(BYTE)((id>>16)&0xFF),
                                 (BYTE)((id>>8)&0xFF),(BYTE)(id&0xFF)};
@@ -1020,36 +1127,35 @@ static void LoadTPM(HTREEITEM hRoot)
         }
     }
 
-    /* ── PCR values + EK cert via TBS ─────────────────────────────────── */
     {
         HTREEITEM hPCR = ADD(hTPM,
             L"PCR Values  (Platform Configuration Registers)", 0, COL_HEADER);
 
         static const wchar_t *pcrDesc[24] = {
-            L"PCR 0  — UEFI firmware / BIOS code",
-            L"PCR 1  — UEFI firmware config & data",
-            L"PCR 2  — Option ROM code",
-            L"PCR 3  — Option ROM config & data",
-            L"PCR 4  — Boot manager & MBR/GPT",
-            L"PCR 5  — Boot manager config (GPT table)",
-            L"PCR 6  — Resume from S4/S5",
-            L"PCR 7  — Secure Boot state & policy",
-            L"PCR 8  — NTFS boot sector",
-            L"PCR 9  — NTFS boot block",
-            L"PCR 10 — Boot manager (BitLocker)",
-            L"PCR 11 — BitLocker access control",
-            L"PCR 12 — Data events & OS config",
-            L"PCR 13 — Boot module details",
-            L"PCR 14 — Boot authorities",
-            L"PCR 15 — OS defined / user",
-            L"PCR 16 — Debug",
-            L"PCR 17 — DRTM ACM",
-            L"PCR 18 — DRTM MLE",
-            L"PCR 19 — DRTM OS",
-            L"PCR 20 — DRTM OS (kernel)",
-            L"PCR 21 — DRTM OS defined",
-            L"PCR 22 — DRTM OS defined",
-            L"PCR 23 — App defined",
+            L"PCR 0  \u2014 UEFI firmware / BIOS code",
+            L"PCR 1  \u2014 UEFI firmware config & data",
+            L"PCR 2  \u2014 Option ROM code",
+            L"PCR 3  \u2014 Option ROM config & data",
+            L"PCR 4  \u2014 Boot manager & MBR/GPT",
+            L"PCR 5  \u2014 Boot manager config (GPT table)",
+            L"PCR 6  \u2014 Resume from S4/S5",
+            L"PCR 7  \u2014 Secure Boot state & policy",
+            L"PCR 8  \u2014 NTFS boot sector",
+            L"PCR 9  \u2014 NTFS boot block",
+            L"PCR 10 \u2014 Boot manager (BitLocker)",
+            L"PCR 11 \u2014 BitLocker access control",
+            L"PCR 12 \u2014 Data events & OS config",
+            L"PCR 13 \u2014 Boot module details",
+            L"PCR 14 \u2014 Boot authorities",
+            L"PCR 15 \u2014 OS defined / user",
+            L"PCR 16 \u2014 Debug",
+            L"PCR 17 \u2014 DRTM ACM",
+            L"PCR 18 \u2014 DRTM MLE",
+            L"PCR 19 \u2014 DRTM OS",
+            L"PCR 20 \u2014 DRTM OS (kernel)",
+            L"PCR 21 \u2014 DRTM OS defined",
+            L"PCR 22 \u2014 DRTM OS defined",
+            L"PCR 23 \u2014 App defined",
         };
 
         typedef struct { UINT32 version; UINT32 grbitConn; } TBS_CTX_PARAMS2;
@@ -1083,7 +1189,7 @@ static void LoadTPM(HTREEITEM hRoot)
         }
 
         if(!tbsOk){
-            ADD(hPCR, L"(TBS context failed — is the TPM driver running?)", 2, COL_WARN);
+            ADD(hPCR, L"(TBS context failed \u2014 is the TPM driver running?)", 2, COL_WARN);
         } else {
             BYTE  pcrData[2][24][32] = {0};
             DWORD pcrLen [2][24]     = {0};
@@ -1154,9 +1260,7 @@ static void LoadTPM(HTREEITEM hRoot)
 
             BOOL anyPCR = FALSE;
 
-            /* Auto-save baseline on first run (no file exists yet) */
             if(!g_baselineValid){
-                /* Only auto-save if we actually got real data */
                 BOOL hasRealData = FALSE;
                 for(int pcr=0;pcr<PCR_COUNT;pcr++)
                     if(pcrGot[1][pcr]){ hasRealData=TRUE; break; }
@@ -1167,8 +1271,7 @@ static void LoadTPM(HTREEITEM hRoot)
                             memcpy(autoBase[pcr],pcrData[1][pcr],PCR_HASH_LEN);
                     SaveBaseline(autoBase);
                     g_baselineDirty=FALSE;
-                    SendMessage(g_hStatus,SB_SETTEXT,0,
-                        (LPARAM)L"Baseline auto-saved on first run  ✔");
+                    SetStatusMsg(L"Baseline auto-saved on first run  \u2714");
                 }
             }
 
@@ -1191,11 +1294,8 @@ static void LoadTPM(HTREEITEM hRoot)
                     }
                 }
 
-                /* ── Baseline comparison (SHA-256 bank only) ── */
                 BOOL changed = FALSE;
                 if(g_baselineValid && hasSHA256 && !allFF){
-                    /* A PCR that was zero in baseline and is still zero = unchanged.
-                       A PCR that differs from baseline = CHANGED. */
                     changed = (memcmp(pcrData[1][pcr],
                                       g_baseline[pcr],
                                       PCR_HASH_LEN) != 0);
@@ -1204,9 +1304,9 @@ static void LoadTPM(HTREEITEM hRoot)
                 const wchar_t *desc = pcrDesc[pcr];
                 wchar_t nodeLabel[320];
                 if(changed)
-                    swprintf_s(nodeLabel,319,L"⚠  %s  — CHANGED",desc);
+                    swprintf_s(nodeLabel,319,L"\u26A0  %s  \u2014 CHANGED",desc);
                 else if(allFF)
-                    swprintf_s(nodeLabel,319,L"%s  ⊘ disabled",desc);
+                    swprintf_s(nodeLabel,319,L"%s  \u2298 disabled",desc);
                 else if(allZero)
                     swprintf_s(nodeLabel,319,L"%s  (not extended)",desc);
                 else
@@ -1230,7 +1330,6 @@ static void LoadTPM(HTREEITEM hRoot)
                         ADD(hP,lbl,2,COL_DEFAULT);
                     }
 
-                    /* Show baseline diff if changed */
                     if(changed){
                         wchar_t oldHex[72]={0};
                         for(int b=0;b<PCR_HASH_LEN;b++)
@@ -1238,16 +1337,14 @@ static void LoadTPM(HTREEITEM hRoot)
                         wchar_t oldLbl[200];
                         swprintf_s(oldLbl,199,L"Baseline: %s",oldHex);
                         ADD(hP,oldLbl,2,COL_BAD);
-                        ADD(hP,L"⚠  Value differs from saved baseline — possible boot tampering!",
+                        ADD(hP,L"\u26A0  Value differs from saved baseline \u2014 possible boot tampering!",
                             3,COL_BAD);
-                        /* Force expand so the diff is immediately visible */
                         SendMessage(g_hTree,TVM_EXPAND,TVE_EXPAND,(LPARAM)hP);
                     }
                 }
                 anyPCR = TRUE;
             }
 
-            /* Update status bar if any changes detected */
             if(g_baselineValid){
                 int nChanged=0;
                 for(int pcr=0;pcr<PCR_COUNT;pcr++){
@@ -1261,18 +1358,17 @@ static void LoadTPM(HTREEITEM hRoot)
                 if(nChanged>0){
                     wchar_t warn[200];
                     swprintf_s(warn,199,
-                        L"⚠  WARNING: %d PCR(s) changed since baseline — possible boot tampering!",
+                        L"\u26A0  WARNING: %d PCR(s) changed since baseline \u2014 possible boot tampering!",
                         nChanged);
-                    SendMessage(g_hStatus,SB_SETTEXT,0,(LPARAM)warn);
+                    SetStatusMsg(warn);
                 }
             }
 
             if(!anyPCR)
-                ADD(hPCR,L"(no PCR data returned — TPM may not be active)",2,COL_WARN);
+                ADD(hPCR,L"(no PCR data returned \u2014 TPM may not be active)",2,COL_WARN);
             else
                 SendMessage(g_hTree,TVM_EXPAND,TVE_EXPAND,(LPARAM)hPCR);
 
-            /* ── EK Certificate — reuse the same TBS context ── */
             LoadEKCert(hTPM, hCtx, fnSubmit);
 
             fnClose(hCtx);
@@ -1287,7 +1383,7 @@ noWMI:
 
     if(!wmiOk){
         ADD(hTPM,
-            L"WMI query failed — try running as Administrator", 2, COL_WARN);
+            L"WMI query failed \u2014 try running as Administrator", 2, COL_WARN);
 
         HTREEITEM hReg = ADD(hTPM, L"Registry fallback info", 0, COL_HEADER);
         wchar_t val[256]={0};
@@ -1313,7 +1409,7 @@ noWMI:
                 QueryServiceStatus(hSvc2,&ss);
                 ADD(hReg,
                     ss.dwCurrentState==SERVICE_RUNNING
-                        ? L"TPM driver: Running  ✔"
+                        ? L"TPM driver: Running  \u2714"
                         : L"TPM driver: Not running",
                     2,
                     ss.dwCurrentState==SERVICE_RUNNING?COL_GOOD:COL_WARN);
@@ -1331,7 +1427,6 @@ noWMI:
 /* ═══════════════════════════════════════════════════════════
    TCG Event Log
    ══════════════════════════════════════════════════════════ */
-
 static const wchar_t *TcgEventTypeName(UINT32 t)
 {
     switch(t){
@@ -1417,7 +1512,7 @@ static void LoadTCGLog(HTREEITEM hRoot)
         TBS_CP2 p2={1,0}; fnCreate(&p2,&hCtx);
     }
     if(!hCtx){
-        ADD(hLog,L"(could not open TBS context — run as Administrator)",2,COL_WARN);
+        ADD(hLog,L"(could not open TBS context \u2014 run as Administrator)",2,COL_WARN);
         FreeLibrary(hTbs); return;
     }
 
@@ -1491,16 +1586,17 @@ static void LoadTCGLog(HTREEITEM hRoot)
                 } else {
                     BOOL allPrint = TRUE;
                     for(UINT32 i=0;i<evSize&&i<64;i++)
-                        if(evData[i]!=0&&evData[i]<0x20&&evData[i]!=0x0A&&evData[i]!=0x0D)
+                        if(evData[i]==0||evData[i]>=0x7F||
+                           (evData[i]<0x20&&evData[i]!=0x0A&&evData[i]!=0x0D))
                             {allPrint=FALSE;break;}
-                    if(allPrint && evData[0]>=0x20)
-                        MultiByteToWideChar(CP_ACP,0,(char*)evData,
+                    if(allPrint && evData[0]>=0x20 && evData[0]<0x7F)
+                        MultiByteToWideChar(CP_UTF8,0,(char*)evData,
                                             evSize>128?128:(int)evSize,dataBuf,255);
                     else{
                         UINT32 hex=evSize<12?evSize:12;
                         for(UINT32 i=0;i<hex;i++)
                             swprintf_s(dataBuf+i*3,4,L"%02X ",evData[i]);
-                        if(evSize>12) wcscat(dataBuf,L"…");
+                        if(evSize>12) wcscat(dataBuf,L"\u2026");
                     }
                 }
             }
@@ -1593,9 +1689,9 @@ static void LoadTCGLog(HTREEITEM hRoot)
                         BOOL ok=TRUE;
                         UINT32 show=evSize>200?200:evSize;
                         for(UINT32 i=0;i<show;i++)
-                            if(evData[i]!=0&&evData[i]<0x20){ok=FALSE;break;}
-                        if(ok && evData[0]>=0x20)
-                            MultiByteToWideChar(CP_ACP,0,(char*)evData,(int)show,dataBuf,511);
+                            if(evData[i]==0||evData[i]>=0x7F||evData[i]<0x20){ok=FALSE;break;}
+                        if(ok && evData[0]>=0x20 && evData[0]<0x7F)
+                            MultiByteToWideChar(CP_UTF8,0,(char*)evData,(int)show,dataBuf,511);
                         else{
                             UINT32 h=evSize<16?evSize:16;
                             for(UINT32 i=0;i<h;i++) swprintf_s(dataBuf+i*3,4,L"%02X ",evData[i]);
@@ -1606,9 +1702,9 @@ static void LoadTCGLog(HTREEITEM hRoot)
             } else if(evSize>0&&evSize<256){
                 BOOL allPrint=TRUE;
                 for(UINT32 i=0;i<evSize&&i<64;i++)
-                    if(evData[i]!=0&&evData[i]<0x20){allPrint=FALSE;break;}
-                if(allPrint && evData[0]>=0x20)
-                    MultiByteToWideChar(CP_ACP,0,(char*)evData,
+                    if(evData[i]==0||evData[i]>=0x7F||evData[i]<0x20){allPrint=FALSE;break;}
+                if(allPrint && evData[0]>=0x20 && evData[0]<0x7F)
+                    MultiByteToWideChar(CP_UTF8,0,(char*)evData,
                                         evSize>128?128:(int)evSize,dataBuf,511);
             }
 
@@ -1652,7 +1748,7 @@ static void LoadTCGLog(HTREEITEM hRoot)
     }
 
     if(totalEvents==0)
-        ADD(hLog,L"(no events parsed — log may be in an unsupported format)",2,COL_WARN);
+        ADD(hLog,L"(no events parsed \u2014 log may be in an unsupported format)",2,COL_WARN);
     else {
         swprintf_s(szTotal,63,L"Total: %d events across %d PCRs",
             totalEvents,
@@ -1664,6 +1760,7 @@ static void LoadTCGLog(HTREEITEM hRoot)
         SendMessage(g_hTree,TVM_INSERTITEMW,0,(LPARAM)&tvi);
     }
 }
+
 static const wchar_t *FriendlyAlgo(const wchar_t *a){
     if(!a) return L"?";
     if(wcsstr(a,L"RSA"))    return L"RSA";
@@ -1846,7 +1943,7 @@ static void LoadGPG(HTREEITEM hRoot)
             int c2=0;wchar_t *p2=line;while(*p2&&c2<9)if(*p2++==L':')c2++;
             if(*p2){swprintf_s(lbl,511,L"UID: %s",p2);ADD(hKey,lbl,2,COL_DEFAULT);}
         } else if(wcsncmp(line,L"ssb",3)==0&&hKey){
-            ADD(hKey,L"↳ Signing subkey",2,COL_DEFAULT);
+            ADD(hKey,L"\u21B3 Signing subkey",2,COL_DEFAULT);
         }
         line=wcstok_s(NULL,L"\n",&ctx);
     }
@@ -1922,7 +2019,7 @@ static void LoadCerts(HTREEITEM hRoot)
             SYSTEMTIME nb,na;
             FileTimeToSystemTime(&px->pCertInfo->NotBefore,&nb);
             FileTimeToSystemTime(&px->pCertInfo->NotAfter,&na);
-            swprintf_s(lbl,511,L"Valid: %04d-%02d-%02d → %04d-%02d-%02d",
+            swprintf_s(lbl,511,L"Valid: %04d-%02d-%02d \u2192 %04d-%02d-%02d",
                 nb.wYear,nb.wMonth,nb.wDay,na.wYear,na.wMonth,na.wDay);
             ADD(hCC,lbl,2,COL_DEFAULT);
             cnt++;
@@ -1934,11 +2031,9 @@ static void LoadCerts(HTREEITEM hRoot)
     SendMessage(g_hTree,TVM_EXPAND,TVE_EXPAND,(LPARAM)hC);
 }
 
-/* ── Save baseline command (toolbar button) ─────────────── */
+/* ── Save baseline command ──────────────────────────────── */
 static void SaveBaselineCmd(void)
 {
-    /* Re-read live PCRs and save them as the new baseline.
-       We piggyback on the same TBS pattern used in LoadTPM. */
     typedef struct { UINT32 version; UINT32 grbitConn; } TBS_CP;
     typedef UINT32 (WINAPI *PFN_CC)(TBS_CP*,void**);
     typedef UINT32 (WINAPI *PFN_CL)(void*);
@@ -1967,7 +2062,7 @@ static void SaveBaselineCmd(void)
         cmd[0]=0x80;cmd[1]=0x01; cmd[2]=0x00;cmd[3]=0x00;cmd[4]=0x00;cmd[5]=0x14;
         cmd[6]=0x00;cmd[7]=0x00;cmd[8]=0x01;cmd[9]=0x7E;
         cmd[10]=0x00;cmd[11]=0x00;cmd[12]=0x00;cmd[13]=0x01;
-        cmd[14]=0x00;cmd[15]=0x0B; /* SHA-256 */
+        cmd[14]=0x00;cmd[15]=0x0B;
         cmd[16]=0x03; cmd[17]=mask[0];cmd[18]=mask[1];cmd[19]=mask[2];
 
         BYTE rsp[4096]={0}; UINT32 rspSz=sizeof(rsp);
@@ -1975,7 +2070,7 @@ static void SaveBaselineCmd(void)
         UINT32 rc=((UINT32)rsp[6]<<24)|((UINT32)rsp[7]<<16)|((UINT32)rsp[8]<<8)|rsp[9];
         if(rc!=0) continue;
 
-        DWORD off=10+4; /* skip header+updateCounter */
+        DWORD off=10+4;
         if(off+4>rspSz) continue;
         UINT32 selCount=((UINT32)rsp[off]<<24)|((UINT32)rsp[off+1]<<16)|((UINT32)rsp[off+2]<<8)|rsp[off+3]; off+=4;
         for(UINT32 s=0;s<selCount;s++){ if(off+4>rspSz)break; BYTE szS=rsp[off+2]; off+=2+1+szS; }
@@ -1997,19 +2092,22 @@ static void SaveBaselineCmd(void)
     SaveBaseline(newBase);
     g_baselineDirty=FALSE;
 
-    /* Timestamp the save in status bar */
     SYSTEMTIME st; GetLocalTime(&st);
     wchar_t msg[200];
     swprintf_s(msg,199,
-        L"Baseline saved  ✔  (%04d-%02d-%02d %02d:%02d:%02d)  — refresh to compare",
+        L"Baseline saved  \u2714  (%04d-%02d-%02d %02d:%02d:%02d)  \u2014 refresh to compare",
         st.wYear,st.wMonth,st.wDay,st.wHour,st.wMinute,st.wSecond);
-    SendMessage(g_hStatus,SB_SETTEXT,0,(LPARAM)msg);
+    SetStatusMsg(msg);
 }
 
 static void SnapshotTree(void); /* forward decl */
 
 static void Populate(void)
 {
+    /* Disable refresh button while loading */
+    EnableWindow(GetDlgItem(g_hWnd, ID_REFRESH), FALSE);
+    SetStatusMsg(L"Loading\u2026");
+
     SendMessage(g_hTree,WM_SETREDRAW,FALSE,0);
     TreeView_DeleteAllItems(g_hTree);
     HTREEITEM hR=AddItem(g_hTree,TVI_ROOT,L"Signing Keys & Trust Anchors",0,COL_HEADER);
@@ -2023,11 +2121,24 @@ static void Populate(void)
     SendMessage(g_hTree,TVM_EXPAND,TVE_EXPAND,(LPARAM)hR);
     SendMessage(g_hTree,WM_SETREDRAW,TRUE,0);
     InvalidateRect(g_hTree,NULL,TRUE);
+
     SnapshotTree();
-    SendMessage(g_hStatus,SB_SETTEXT,0,
-        (LPARAM)L"Ready  |  Double-click to copy  |  Type in search box to filter");
+
+    /* Update all three status panels */
+    int count = CountTreeItems();
+    SetStatusCount(count);
+    SetStatusTime();
+
+    /* Only set default message if no warning was already posted */
+    wchar_t cur[256]={0};
+    SendMessage(g_hStatus, SB_GETTEXT, SB_PANEL_MSG, (LPARAM)cur);
+    if(cur[0]==0 || wcscmp(cur,L"Loading\u2026")==0)
+        SetStatusMsg(L"Ready  \u2502  F5=Refresh  Ctrl+F=Search  Ctrl+E=Expand  Ctrl+W=Collapse");
+
+    EnableWindow(GetDlgItem(g_hWnd, ID_REFRESH), TRUE);
 }
 
+/* ── Tree snapshot / search ─────────────────────────────── */
 #define MAX_NODES 4096
 
 typedef struct {
@@ -2123,11 +2234,20 @@ static void DoSearch(void)
     RebuildFromSnapshot(needle);
 
     wchar_t status[300];
-    if(needle[0])
-        swprintf_s(status,299,L"Filtering: \"%s\"  —  clear to restore full tree",needle);
-    else
-        wcscpy(status,L"Ready  |  Double-click to copy  |  Type in search box to filter");
-    SendMessage(g_hStatus,SB_SETTEXT,0,(LPARAM)status);
+    if(needle[0]){
+        swprintf_s(status,299,L"Filter: \"%s\"  \u2014  Esc to clear",needle);
+        /* Highlight search box background when filtering */
+    } else {
+        wcscpy(status,L"Ready  \u2502  F5=Refresh  Ctrl+F=Search  Ctrl+E=Expand  Ctrl+W=Collapse");
+    }
+    SetStatusMsg(status);
+}
+
+static void ClearSearch(void)
+{
+    SetWindowTextW(g_hSearch, L"");
+    DoSearch();
+    SetFocus(g_hTree);
 }
 
 static void CopySelected(void)
@@ -2144,9 +2264,10 @@ static void CopySelected(void)
     HGLOBAL hM=GlobalAlloc(GMEM_MOVEABLE,bytes);
     if(hM){memcpy(GlobalLock(hM),buf,bytes);GlobalUnlock(hM);SetClipboardData(CF_UNICODETEXT,hM);}
     CloseClipboard();
-    SendMessage(g_hStatus,SB_SETTEXT,0,(LPARAM)L"Copied to clipboard!");
+    SetStatusMsg(L"Copied to clipboard  \u2714");
 }
 
+/* ── Custom draw (colors + splitter hover highlight) ──── */
 static LRESULT HandleCustomDraw(NMTVCUSTOMDRAW *cd)
 {
     switch(cd->nmcd.dwDrawStage){
@@ -2155,11 +2276,15 @@ static LRESULT HandleCustomDraw(NMTVCUSTOMDRAW *cd)
         int col=(int)cd->nmcd.lItemlParam;
         if(col>=0&&col<(int)(sizeof(g_colors)/sizeof(g_colors[0])))
             cd->clrText=g_colors[col];
+        /* Slightly tint selected items */
+        if(cd->nmcd.uItemState & CDIS_SELECTED)
+            cd->clrTextBk = RGB(220, 235, 255);
         return CDRF_DODEFAULT;
     }}
     return CDRF_DODEFAULT;
 }
 
+/* ── Image list ─────────────────────────────────────────── */
 static HIMAGELIST MakeIL(void)
 {
     HIMAGELIST h=ImageList_Create(16,16,ILC_COLOR32|ILC_MASK,4,0);
@@ -2178,6 +2303,7 @@ static HIMAGELIST MakeIL(void)
     return h;
 }
 
+/* ── Layout ─────────────────────────────────────────────── */
 static void DoLayout(int W,int H)
 {
     if(g_splitX<=0) g_splitX=DETAIL_DEF;
@@ -2185,18 +2311,26 @@ static void DoLayout(int W,int H)
 
     int treeW=W-g_splitX-SPLITTER_W;
     int detW=g_splitX;
-    int contentH=H-TOOLBAR_H;
-    RECT sr;GetWindowRect(g_hStatus,&sr);
+
+    /* Status bar height */
+    RECT sr; GetWindowRect(g_hStatus,&sr);
     int sbH=sr.bottom-sr.top;
-    contentH-=sbH;
+    int contentH=H-TOOLBAR_H-sbH;
 
     SetWindowPos(g_hTree,NULL,0,TOOLBAR_H,treeW,contentH,SWP_NOZORDER);
-    SetWindowPos(GetDlgItem(g_hWnd,ID_SPLITTER),NULL,
-                 treeW,TOOLBAR_H,SPLITTER_W,contentH,SWP_NOZORDER);
+    SetWindowPos(g_hSplitter,NULL,treeW,TOOLBAR_H,SPLITTER_W,contentH,SWP_NOZORDER);
     SetWindowPos(g_hDetail,NULL,treeW+SPLITTER_W,TOOLBAR_H,detW,contentH,SWP_NOZORDER);
     SendMessage(g_hStatus,WM_SIZE,0,0);
+
+    /* Resize status bar panels: message takes majority, count=120, time=160 */
+    int parts[3];
+    parts[2] = W;
+    parts[1] = W - 160;
+    parts[0] = W - 160 - 120;
+    SendMessage(g_hStatus, SB_SETPARTS, 3, (LPARAM)parts);
 }
 
+/* ── Detail pane update ─────────────────────────────────── */
 static void UpdateDetail(HTREEITEM hSel)
 {
     if(!hSel){SetWindowTextW(g_hDetail,L"");return;}
@@ -2226,8 +2360,8 @@ static void UpdateDetail(HTREEITEM hSel)
 
     tmp[0]=0; it.hItem=hSel;
     SendMessage(g_hTree,TVM_GETITEMW,0,(LPARAM)&it);
-    DETAPPEND(L"", tmp);
-    DETAPPEND(L"", L"────────────────────────────");
+    DETAPPEND(L"\u25B6 ", tmp);
+    DETAPPEND(L"", L"\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500");
 
     int total = 0;
     HTREEITEM ch = TreeView_GetChild(g_hTree, hSel);
@@ -2248,7 +2382,7 @@ static void UpdateDetail(HTREEITEM hSel)
         ch = TreeView_GetNextSibling(g_hTree, ch);
     }
     if(total >= 500)
-        DETAPPEND(L"  ", L"... (truncated — click individual entries to see more)");
+        DETAPPEND(L"  ", L"\u2026 (truncated \u2014 click individual entries to see more)");
 
 #undef DETAPPEND
 
@@ -2256,26 +2390,121 @@ static void UpdateDetail(HTREEITEM hSel)
     free(buf);
 }
 
+/* ── Splitter custom paint (hover highlight) ─────────────── */
+static LRESULT CALLBACK SplitterProc(HWND hWnd, UINT msg, WPARAM wP, LPARAM lP)
+{
+    switch(msg){
+    case WM_PAINT:{
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(hWnd, &ps);
+        RECT rc; GetClientRect(hWnd, &rc);
+        COLORREF col = g_dragging ? RGB(0,120,215)
+                     : g_splitterHot ? RGB(100,180,240)
+                     : RGB(210,210,210);
+        HBRUSH br = CreateSolidBrush(col);
+        FillRect(hdc, &rc, br);
+        DeleteObject(br);
+        EndPaint(hWnd, &ps);
+        return 0;
+    }
+    case WM_MOUSEMOVE:{
+        if(!g_splitterHot){
+            g_splitterHot = TRUE;
+            InvalidateRect(hWnd, NULL, TRUE);
+            TRACKMOUSEEVENT tme={sizeof(tme),TME_LEAVE,hWnd,0};
+            TrackMouseEvent(&tme);
+        }
+        return 0;
+    }
+    case WM_MOUSELEAVE:
+        g_splitterHot = FALSE;
+        InvalidateRect(hWnd, NULL, TRUE);
+        return 0;
+    }
+    return DefWindowProcW(hWnd, msg, wP, lP);
+}
+
+/* ── Main window procedure ──────────────────────────────── */
 static LRESULT CALLBACK WndProc(HWND hWnd,UINT msg,WPARAM wP,LPARAM lP)
 {
     switch(msg){
     case WM_CREATE:{
         g_hWnd=hWnd;
 
-        CreateWindowW(L"BUTTON",L"Refresh",WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON,
-            4,5,90,28,hWnd,(HMENU)ID_REFRESH,NULL,NULL);
+        /* ── Toolbar buttons ── */
+        int x = 4;
+
+        CreateWindowW(L"BUTTON",L"\u21BA Refresh",WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON,
+            x,BTN_Y,90,BTN_H,hWnd,(HMENU)ID_REFRESH,NULL,NULL);
+        x += 94;
+
         CreateWindowW(L"BUTTON",L"Copy",WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON,
-            100,5,75,28,hWnd,(HMENU)ID_COPYKEY,NULL,NULL);
+            x,BTN_Y,60,BTN_H,hWnd,(HMENU)ID_COPYKEY,NULL,NULL);
+        x += 64;
+
         CreateWindowW(L"BUTTON",L"Save Baseline",WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON,
-            181,5,110,28,hWnd,(HMENU)ID_BASELINE,NULL,NULL);
-        CreateWindowW(L"STATIC",L"Search:",WS_CHILD|WS_VISIBLE|SS_CENTERIMAGE,
-            300,5,55,28,hWnd,(HMENU)-1,NULL,NULL);
+            x,BTN_Y,110,BTN_H,hWnd,(HMENU)ID_BASELINE,NULL,NULL);
+        x += 118;
+
+        /* Visual separator */
+        CreateWindowW(L"STATIC",L"",WS_CHILD|WS_VISIBLE|SS_ETCHEDVERT,
+            x,BTN_Y+2,2,BTN_H-4,hWnd,(HMENU)-1,NULL,NULL);
+        x += 10;
+
+        CreateWindowW(L"BUTTON",L"+ All",WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON,
+            x,BTN_Y,55,BTN_H,hWnd,(HMENU)ID_EXPANDALL,NULL,NULL);
+        x += 59;
+
+        CreateWindowW(L"BUTTON",L"\u2212 All",WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON,
+            x,BTN_Y,55,BTN_H,hWnd,(HMENU)ID_COLLAPSEALL,NULL,NULL);
+        x += 63;
+
+        /* Visual separator */
+        CreateWindowW(L"STATIC",L"",WS_CHILD|WS_VISIBLE|SS_ETCHEDVERT,
+            x,BTN_Y+2,2,BTN_H-4,hWnd,(HMENU)-1,NULL,NULL);
+        x += 10;
+
+        CreateWindowW(L"BUTTON",L"Wrap",WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON,
+            x,BTN_Y,50,BTN_H,hWnd,(HMENU)ID_WORDWRAP,NULL,NULL);
+        x += 54;
+
+        CreateWindowW(L"BUTTON",L"A+",WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON,
+            x,BTN_Y,36,BTN_H,hWnd,(HMENU)ID_FONTPLUS,NULL,NULL);
+        x += 38;
+
+        CreateWindowW(L"BUTTON",L"A-",WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON,
+            x,BTN_Y,36,BTN_H,hWnd,(HMENU)ID_FONTMINUS,NULL,NULL);
+        x += 44;
+
+        /* Visual separator */
+        CreateWindowW(L"STATIC",L"",WS_CHILD|WS_VISIBLE|SS_ETCHEDVERT,
+            x,BTN_Y+2,2,BTN_H-4,hWnd,(HMENU)-1,NULL,NULL);
+        x += 8;
+
+        CreateWindowW(L"STATIC",L"\U0001F50D",WS_CHILD|WS_VISIBLE|SS_CENTERIMAGE,
+            x,BTN_Y,20,BTN_H,hWnd,(HMENU)-1,NULL,NULL);
+        x += 20;
+
         g_hSearch=CreateWindowExW(WS_EX_CLIENTEDGE,L"EDIT",L"",
             WS_CHILD|WS_VISIBLE|ES_AUTOHSCROLL,
-            360,7,200,24,hWnd,(HMENU)ID_SEARCH,NULL,NULL);
+            x,BTN_Y+2,180,BTN_H-4,hWnd,(HMENU)ID_SEARCH,NULL,NULL);
+        /* Cue banner — "Search keys…" placeholder text */
+        SendMessage(g_hSearch, EM_SETCUEBANNER, TRUE,
+                    (LPARAM)L"Search keys\u2026");
 
-        CreateWindowW(L"STATIC",L"",WS_CHILD|WS_VISIBLE|SS_GRAYRECT,
-            0,0,SPLITTER_W,100,hWnd,(HMENU)ID_SPLITTER,NULL,NULL);
+        /* Custom splitter window for hover effects */
+        WNDCLASSEXW sc={0};
+        sc.cbSize=sizeof(sc); sc.lpfnWndProc=SplitterProc;
+        sc.hInstance=GetModuleHandleW(NULL);
+        sc.hCursor=LoadCursor(NULL,IDC_SIZEWE);
+        sc.hbrBackground=NULL;
+        sc.lpszClassName=L"KVSplitter";
+        RegisterClassExW(&sc);
+
+        g_hSplitter=CreateWindowW(L"KVSplitter",L"",
+            WS_CHILD|WS_VISIBLE,
+            0,0,SPLITTER_W,100,hWnd,(HMENU)ID_SPLITTER,
+            GetModuleHandleW(NULL),NULL);
 
         g_hTree=CreateWindowExW(WS_EX_CLIENTEDGE,WC_TREEVIEWW,L"",
             WS_CHILD|WS_VISIBLE|WS_VSCROLL|WS_HSCROLL|
@@ -2284,33 +2513,61 @@ static LRESULT CALLBACK WndProc(HWND hWnd,UINT msg,WPARAM wP,LPARAM lP)
             0,TOOLBAR_H,600,500,hWnd,(HMENU)ID_TREEVIEW,NULL,NULL);
         TreeView_SetImageList(g_hTree,MakeIL(),TVSIL_NORMAL);
 
-        g_hDetail=CreateWindowExW(WS_EX_CLIENTEDGE,L"EDIT",L"",
-            WS_CHILD|WS_VISIBLE|WS_VSCROLL|ES_MULTILINE|
-            ES_READONLY|ES_AUTOVSCROLL,
-            0,TOOLBAR_H,300,500,hWnd,(HMENU)ID_DETAIL,NULL,NULL);
-        HFONT hF=CreateFontW(14,0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,
-            DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,
-            CLEARTYPE_QUALITY,FIXED_PITCH,L"Consolas");
-        SendMessage(g_hDetail,WM_SETFONT,(WPARAM)hF,TRUE);
+        /* Increase tree item row height slightly for readability */
+        SendMessage(g_hTree, TVM_SETITEMHEIGHT, 20, 0);
 
-        g_hStatus=CreateWindowExW(0,STATUSCLASSNAMEW,L"Loading…",
+        g_hDetail=CreateWindowExW(WS_EX_CLIENTEDGE,L"EDIT",L"",
+            WS_CHILD|WS_VISIBLE|WS_VSCROLL|WS_HSCROLL|
+            ES_MULTILINE|ES_READONLY|ES_AUTOVSCROLL|ES_AUTOHSCROLL,
+            0,TOOLBAR_H,300,500,hWnd,(HMENU)ID_DETAIL,NULL,NULL);
+
+        RebuildDetailFont();
+
+        /* 3-panel status bar */
+        g_hStatus=CreateWindowExW(0,STATUSCLASSNAMEW,NULL,
             WS_CHILD|WS_VISIBLE|SBARS_SIZEGRIP,
             0,0,0,0,hWnd,(HMENU)ID_STATUSBAR,NULL,NULL);
 
         g_splitX=DETAIL_DEF;
+        UpdateWindowTitle();
         Populate();
         return 0;
     }
+
     case WM_SIZE:
         DoLayout(LOWORD(lP),HIWORD(lP));
         return 0;
 
     case WM_COMMAND:
-        if(LOWORD(wP)==ID_REFRESH) Populate();
+        if(LOWORD(wP)==ID_REFRESH)      Populate();
         else if(LOWORD(wP)==ID_COPYKEY) CopySelected();
-        else if(LOWORD(wP)==ID_BASELINE) SaveBaselineCmd();
+        else if(LOWORD(wP)==ID_BASELINE)SaveBaselineCmd();
+        else if(LOWORD(wP)==ID_EXPANDALL)   DoExpandAll();
+        else if(LOWORD(wP)==ID_COLLAPSEALL) DoCollapseAll();
+        else if(LOWORD(wP)==ID_WORDWRAP)    ToggleWordWrap();
+        else if(LOWORD(wP)==ID_FONTPLUS){
+            if(g_detailFontSize < 24){ g_detailFontSize++; RebuildDetailFont(); }
+        }
+        else if(LOWORD(wP)==ID_FONTMINUS){
+            if(g_detailFontSize > 8){ g_detailFontSize--; RebuildDetailFont(); }
+        }
         else if(LOWORD(wP)==ID_SEARCH&&HIWORD(wP)==EN_CHANGE) DoSearch();
         return 0;
+
+    case WM_KEYDOWN:{
+        /* Global keyboard shortcuts */
+        BOOL ctrl  = (GetKeyState(VK_CONTROL)&0x8000) != 0;
+        BOOL shift = (GetKeyState(VK_SHIFT)   &0x8000) != 0;
+
+        if(wP==VK_F5)                        { Populate(); return 0; }
+        if(ctrl && wP=='C' && !shift)        { CopySelected(); return 0; }
+        if(ctrl && wP=='F')                  { SetFocus(g_hSearch); return 0; }
+        if(ctrl && wP=='E')                  { DoExpandAll(); return 0; }
+        if(ctrl && wP=='W')                  { DoCollapseAll(); return 0; }
+        if(ctrl && wP=='S')                  { SaveBaselineCmd(); return 0; }
+        if(wP==VK_ESCAPE && GetFocus()==g_hSearch) { ClearSearch(); return 0; }
+        break;
+    }
 
     case WM_NOTIFY:{
         NMHDR *nm=(NMHDR*)lP;
@@ -2328,11 +2585,12 @@ static LRESULT CALLBACK WndProc(HWND hWnd,UINT msg,WPARAM wP,LPARAM lP)
 
     case WM_LBUTTONDOWN:{
         POINT pt={LOWORD(lP),HIWORD(lP)};
-        RECT r; GetWindowRect(GetDlgItem(hWnd,ID_SPLITTER),&r);
+        RECT r; GetWindowRect(g_hSplitter,&r);
         POINT tl={r.left,r.top}; ScreenToClient(hWnd,&tl);
         if(pt.x>=tl.x-4&&pt.x<=tl.x+SPLITTER_W+4){
             g_dragging=TRUE; SetCapture(hWnd);
             SetCursor(LoadCursor(NULL,IDC_SIZEWE));
+            InvalidateRect(g_hSplitter, NULL, TRUE);
         }
         return 0;
     }
@@ -2346,18 +2604,26 @@ static LRESULT CALLBACK WndProc(HWND hWnd,UINT msg,WPARAM wP,LPARAM lP)
         }
         return 0;
     case WM_LBUTTONUP:
-        if(g_dragging){g_dragging=FALSE;ReleaseCapture();}
+        if(g_dragging){
+            g_dragging=FALSE;
+            ReleaseCapture();
+            InvalidateRect(g_hSplitter, NULL, TRUE);
+        }
         return 0;
+
     case WM_SETCURSOR:{
         POINT pt; GetCursorPos(&pt); ScreenToClient(hWnd,&pt);
-        RECT r; GetWindowRect(GetDlgItem(hWnd,ID_SPLITTER),&r);
+        RECT r; GetWindowRect(g_hSplitter,&r);
         POINT tl={r.left,r.top}; ScreenToClient(hWnd,&tl);
         if(pt.x>=tl.x-2&&pt.x<=tl.x+SPLITTER_W+2){
             SetCursor(LoadCursor(NULL,IDC_SIZEWE));return TRUE;}
         break;
     }
+
     case WM_DESTROY:
-        PostQuitMessage(0); return 0;
+        if(g_detailFont) DeleteObject(g_detailFont);
+        PostQuitMessage(0);
+        return 0;
     }
     return DefWindowProcW(hWnd,msg,wP,lP);
 }
@@ -2379,14 +2645,44 @@ int WINAPI WinMain(HINSTANCE hI,HINSTANCE hP,LPSTR lC,int nS)
     RegisterClassExW(&wc);
 
     HWND hWnd=CreateWindowExW(0,L"KeyViewerWnd2",
-        L"WinView",
+        L"Key Viewer",
         WS_OVERLAPPEDWINDOW,
-        CW_USEDEFAULT,CW_USEDEFAULT,1100,700,
+        CW_USEDEFAULT,CW_USEDEFAULT,1200,750,
         NULL,NULL,hI,NULL);
     ShowWindow(hWnd,nS); UpdateWindow(hWnd);
 
     MSG m;
-    while(GetMessage(&m,NULL,0,0)){TranslateMessage(&m);DispatchMessage(&m);}
+    while(GetMessage(&m,NULL,0,0)){
+        /* Route keyboard shortcuts through the main window */
+        if(m.message==WM_KEYDOWN){
+            BOOL ctrl  = (GetKeyState(VK_CONTROL)&0x8000) != 0;
+            BOOL shift = (GetKeyState(VK_SHIFT)   &0x8000) != 0;
+
+            if(m.wParam==VK_F5){
+                Populate(); continue;
+            }
+            if(ctrl && m.wParam=='F'){
+                SetFocus(g_hSearch); continue;
+            }
+            if(ctrl && m.wParam=='C' && !shift && GetFocus()!=g_hSearch){
+                CopySelected(); continue;
+            }
+            if(ctrl && m.wParam=='E'){
+                DoExpandAll(); continue;
+            }
+            if(ctrl && m.wParam=='W'){
+                DoCollapseAll(); continue;
+            }
+            if(ctrl && m.wParam=='S'){
+                SaveBaselineCmd(); continue;
+            }
+            if(m.wParam==VK_ESCAPE && GetFocus()==g_hSearch){
+                ClearSearch(); continue;
+            }
+        }
+        TranslateMessage(&m);
+        DispatchMessage(&m);
+    }
     CoUninitialize();
     return (int)m.wParam;
 }
