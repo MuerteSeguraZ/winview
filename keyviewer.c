@@ -1612,6 +1612,99 @@ static const wchar_t *DpTypeName(BYTE type, BYTE sub)
     return NULL;
 }
 
+/* ── Parse a raw GPT header (starts with "EFI PART") ────────
+   Adds child nodes to hParent. Returns TRUE if it looked valid. */
+static BOOL ParseRawGptHeader(HTREEITEM hParent, const BYTE *d, DWORD sz)
+{
+    if(sz < 92) return FALSE;
+    if(memcmp(d, "EFI PART", 8) != 0) return FALSE;
+
+    wchar_t lbl[512];
+
+    /* Revision */
+    WORD revMaj = *(WORD*)(d+0x0A);
+    WORD revMin = *(WORD*)(d+0x08);
+    swprintf_s(lbl,511,L"GPT revision: %u.%u", revMaj, revMin);
+    ADD(hParent,lbl,2,COL_HARDWARE);
+
+    /* Disk GUID at offset 0x38 */
+    wchar_t diskGuid[64]={0}; FmtGuid(d+0x38, diskGuid, 63);
+    swprintf_s(lbl,511,L"Disk GUID: %s", diskGuid);
+    ADD(hParent,lbl,2,COL_HARDWARE);
+
+    /* Geometry */
+    UINT64 altLBA      = *(UINT64*)(d+0x20);
+    UINT64 firstUsable = *(UINT64*)(d+0x28);
+    UINT64 lastUsable  = *(UINT64*)(d+0x30);
+    UINT64 diskSizeGB  = (lastUsable + 1) / (1024*1024*1024/512);
+    swprintf_s(lbl,511,L"Disk size: ~%I64u GB  (LBA 0–%I64u)", diskSizeGB, altLBA);
+    ADD(hParent,lbl,2,COL_DEFAULT);
+    swprintf_s(lbl,511,L"Usable LBAs: %I64u – %I64u", firstUsable, lastUsable);
+    ADD(hParent,lbl,2,COL_DEFAULT);
+
+    /* Partition entry table */
+    DWORD numEntries = *(DWORD*)(d+0x50);
+    DWORD entrySize  = *(DWORD*)(d+0x54);
+    swprintf_s(lbl,511,L"Partition entries: %u x %u bytes", numEntries, entrySize);
+    ADD(hParent,lbl,2,COL_DEFAULT);
+
+    /* Parse partition entries if they follow the header in this event */
+    DWORD hdrSize = *(DWORD*)(d+0x0C);
+    if(hdrSize < 92) hdrSize = 92;
+    if(entrySize == 128 && numEntries <= 128 && sz >= hdrSize + numEntries*entrySize){
+        /* Known GPT type GUIDs */
+        static const struct { const BYTE g[16]; const wchar_t *n; } pt[] = {
+            {{0x28,0x73,0x2A,0xC1,0x1F,0xF8,0xD2,0x11,0xBA,0x4B,0x00,0xA0,0xC9,0x3E,0xC9,0x3B}, L"EFI System"},
+            {{0x16,0xE3,0xC9,0xE3,0x5C,0x0B,0xB8,0x4D,0x81,0x7D,0xF9,0x2D,0xF0,0x02,0x15,0xAE}, L"MS Reserved"},
+            {{0xA2,0xA0,0xD0,0xEB,0xE5,0xB9,0x33,0x44,0x87,0xC0,0x68,0xB6,0xB7,0x26,0x99,0xC7}, L"Basic Data"},
+            {{0xAA,0xC8,0x08,0x58,0x8F,0x7E,0xE0,0x42,0x85,0xD2,0xE1,0xE9,0x04,0x34,0xCF,0xB3}, L"LDM Metadata"},
+            {{0x26,0x58,0x44,0xA9,0x76,0x7B,0xCC,0x45,0xA4,0xBB,0xA4,0xBD,0x2D,0x79,0x06,0x6E}, L"Windows RE"},
+            {{0x0F,0xC6,0x3D,0xAF,0x84,0x83,0x72,0x47,0x8E,0x79,0x3D,0x69,0xD8,0x47,0x7D,0xE4}, L"Linux Data"},
+            {{0x6D,0xFD,0x57,0x06,0xAB,0xA4,0xC4,0x43,0x84,0xE5,0x09,0x33,0xC8,0x4B,0x4F,0x4F}, L"Linux swap"},
+        };
+        int shown = 0;
+        for(DWORD i = 0; i < numEntries; i++){
+            const BYTE *pe = d + hdrSize + i * entrySize;
+            /* Skip empty entries (type GUID all zero) */
+            BOOL empty = TRUE;
+            for(int b=0;b<16;b++) if(pe[b]){empty=FALSE;break;}
+            if(empty) continue;
+
+            UINT64 startLBA = *(UINT64*)(pe+32);
+            UINT64 endLBA   = *(UINT64*)(pe+40);
+            UINT64 sectors  = endLBA >= startLBA ? endLBA-startLBA+1 : 0;
+            UINT64 sizeMB   = sectors / 2048;
+
+            /* Partition name (UTF-16LE, 72 bytes = 36 chars) */
+            wchar_t partName[37]={0};
+            memcpy(partName, pe+56, 72);
+            partName[36]=0;
+            for(int t=35;t>=0&&partName[t]==0;t--) partName[t]=0;
+
+            /* Type GUID friendly name */
+            const wchar_t *ptName = NULL;
+            for(int k=0;k<7;k++) if(memcmp(pe,pt[k].g,16)==0){ ptName=pt[k].n; break; }
+            if(!ptName){
+                wchar_t tg[64]={0}; FmtGuid(pe,tg,63);
+                swprintf_s(lbl,511,L"[%u] %s  —  %s  (%I64u MB)",
+                    i, partName[0]?partName:L"(unnamed)", tg, sizeMB);
+            } else {
+                swprintf_s(lbl,511,L"[%u] %s  —  %s  (%I64u MB)",
+                    i, partName[0]?partName:L"(unnamed)", ptName, sizeMB);
+            }
+            ADD(hParent,lbl,2,ptName?COL_HARDWARE:COL_DEFAULT);
+            shown++;
+        }
+        if(shown == 0)
+            ADD(hParent,L"(no non-empty partition entries in event data)",2,COL_DEFAULT);
+    } else if(numEntries > 0){
+        swprintf_s(lbl,511,
+            L"(partition entries not included in this event — only header measured)");
+        ADD(hParent,lbl,2,COL_DEFAULT);
+    }
+    return TRUE;
+}
+
 /* ═══════════════════════════════════════════════════════════
    ParseEventData — adds rich child nodes to hEv based on evType
    ══════════════════════════════════════════════════════════ */
@@ -1705,8 +1798,16 @@ static void ParseEventData(HTREEITEM hEv, UINT32 evType,
         if(sz >= 16){
             UINT64 base = *(UINT64*)d;
             UINT64 len  = *(UINT64*)(d+8);
-            swprintf_s(lbl,511,L"Base:   0x%016I64X",base);  ADD(hEv,lbl,2,COL_DEFAULT);
-            swprintf_s(lbl,511,L"Length: 0x%I64X (%I64u KB)",len,len/1024); ADD(hEv,lbl,2,COL_DEFAULT);
+            swprintf_s(lbl,511,L"Base:   0x%016I64X",base); ADD(hEv,lbl,2,COL_DEFAULT);
+            if(len > 0 && len < 0x1000000000ULL){
+                if(len >= 1024*1024)
+                    swprintf_s(lbl,511,L"Length: 0x%I64X (%I64u MB)",len,len/(1024*1024));
+                else
+                    swprintf_s(lbl,511,L"Length: 0x%I64X (%I64u KB)",len,len/1024);
+            } else {
+                swprintf_s(lbl,511,L"Length: 0x%I64X  (suspicious value)",len);
+            }
+            ADD(hEv,lbl,2,len>0x1000000000ULL?COL_WARN:COL_DEFAULT);
         }
         break;
 
@@ -1716,30 +1817,84 @@ static void ParseEventData(HTREEITEM hEv, UINT32 evType,
         if(sz >= 16){
             UINT64 base = *(UINT64*)d;
             UINT64 len  = *(UINT64*)(d+8);
-            swprintf_s(lbl,511,L"Base:   0x%016I64X",base);  ADD(hEv,lbl,2,COL_DEFAULT);
-            swprintf_s(lbl,511,L"Length: 0x%I64X (%I64u KB)",len,len/1024); ADD(hEv,lbl,2,COL_DEFAULT);
+            swprintf_s(lbl,511,L"Base:   0x%016I64X",base); ADD(hEv,lbl,2,COL_DEFAULT);
+            if(len > 0 && len < 0x1000000000ULL){
+                if(len >= 1024*1024)
+                    swprintf_s(lbl,511,L"Length: 0x%I64X (%I64u MB)",len,len/(1024*1024));
+                else
+                    swprintf_s(lbl,511,L"Length: 0x%I64X (%I64u KB)",len,len/1024);
+            } else {
+                swprintf_s(lbl,511,L"Length: 0x%I64X  (suspicious value)",len);
+            }
+            ADD(hEv,lbl,2,len>0x1000000000ULL?COL_WARN:COL_DEFAULT);
         }
         break;
 
     /* ── EV_EFI_PLATFORM_FIRMWARE_BLOB2  (0x80000006) ────
-       UEFI_PLATFORM_FIRMWARE_BLOB2: descSize(1) + desc(N) + base(8) + len(8) */
-    case 0x80000006:
-        if(sz >= 1){
-            BYTE descLen = d[0];
-            if((DWORD)1 + descLen + 16 <= sz){
-                wchar_t desc[256]={0};
-                if(TryAscii(d+1, descLen, desc, 255) ||
-                   TryUtf16(d+1, descLen, desc, 255)){
-                    swprintf_s(lbl,511,L"Description: \"%s\"",desc);
-                    ADD(hEv,lbl,2,COL_HARDWARE);
+       UEFI_PLATFORM_FIRMWARE_BLOB2: descSize(1) + desc(N) + base(8) + len(8)
+       Some firmware uses this type to log raw GPT headers or other structures. */
+    case 0x80000006:{
+        BOOL parsed = FALSE;
+
+        /* 1. Check for raw GPT header ("EFI PART" signature at offset 0) */
+        if(sz >= 92 && memcmp(d, "EFI PART", 8) == 0){
+            parsed = ParseRawGptHeader(hEv, d, sz);
+            break;
+        }
+
+        /* 2. Try proper BLOB2: first byte is description length */
+        if(!parsed && sz >= 17){
+            BYTE descLen2 = d[0];
+            DWORD needed = (DWORD)1 + descLen2 + 16;
+            if(needed <= sz && descLen2 <= 64){
+                UINT64 base2 = *(UINT64*)(d + 1 + descLen2);
+                UINT64 len2  = *(UINT64*)(d + 1 + descLen2 + 8);
+                BOOL baseOk = (base2 >= 0x100000ULL) && (base2 < 0x1000000000000ULL);
+                BOOL lenOk  = (len2 > 0) && (len2 <= 0x20000000ULL);
+                if(baseOk && lenOk){
+                    parsed = TRUE;
+                    if(descLen2 > 0){
+                        wchar_t desc[256]={0};
+                        if(TryAscii(d+1, descLen2, desc, 255)){
+                            swprintf_s(lbl,511,L"Description: \"%s\"",desc);
+                            ADD(hEv,lbl,2,COL_HARDWARE);
+                        } else {
+                            AddHexDump(hEv, d+1, descLen2, L"desc: ");
+                        }
+                    }
+                    swprintf_s(lbl,511,L"Base:   0x%016I64X",base2); ADD(hEv,lbl,2,COL_DEFAULT);
+                    if(len2 >= 1024*1024)
+                        swprintf_s(lbl,511,L"Length: 0x%I64X (%I64u MB)",len2,len2/(1024*1024));
+                    else
+                        swprintf_s(lbl,511,L"Length: 0x%I64X (%I64u KB)",len2,len2/1024);
+                    ADD(hEv,lbl,2,COL_DEFAULT);
                 }
-                UINT64 base = *(UINT64*)(d+1+descLen);
-                UINT64 len  = *(UINT64*)(d+1+descLen+8);
-                swprintf_s(lbl,511,L"Base:   0x%016I64X",base); ADD(hEv,lbl,2,COL_DEFAULT);
-                swprintf_s(lbl,511,L"Length: 0x%I64X (%I64u KB)",len,len/1024); ADD(hEv,lbl,2,COL_DEFAULT);
             }
         }
+
+        /* 3. Fall back to plain BLOB (base+len = 16 bytes) */
+        if(!parsed && sz >= 16){
+            UINT64 base2 = *(UINT64*)(d);
+            UINT64 len2  = *(UINT64*)(d+8);
+            BOOL baseOk = (base2 >= 0x100000ULL) && (base2 < 0x1000000000000ULL);
+            BOOL lenOk  = (len2 > 0) && (len2 <= 0x20000000ULL);
+            if(baseOk && lenOk){
+                parsed = TRUE;
+                ADD(hEv,L"(plain BLOB format)",2,COL_DEFAULT);
+                swprintf_s(lbl,511,L"Base:   0x%016I64X",base2); ADD(hEv,lbl,2,COL_DEFAULT);
+                if(len2 >= 1024*1024)
+                    swprintf_s(lbl,511,L"Length: 0x%I64X (%I64u MB)",len2,len2/(1024*1024));
+                else
+                    swprintf_s(lbl,511,L"Length: 0x%I64X (%I64u KB)",len2,len2/1024);
+                ADD(hEv,lbl,2,COL_DEFAULT);
+            }
+        }
+
+        if(!parsed){
+            AddHexDump(hEv,d,sz,L"");
+        }
         break;
+    }
 
     /* ── EV_EFI_HANDOFF_TABLES  (0x80000003 / 0x8000000E) ─
        UEFI_HANDOFF_TABLE_POINTERS: count(8) + (guid(16)+addr(8))*N */
