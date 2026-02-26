@@ -1496,33 +1496,53 @@ static void FmtGuid(const BYTE *g, wchar_t *out, int outLen)
         g[8],g[9], g[10],g[11],g[12],g[13],g[14],g[15]);
 }
 
-/* Attempt to render bytes as a UTF-16LE string; returns TRUE on success */
+/* Attempt to render bytes as a UTF-16LE string; returns TRUE on success.
+   Key insight: genuine UTF-16LE ASCII text has 0x00 as the HIGH byte of
+   each character (e.g. 'E' = 0x45 0x00, not 0x45 0x46).
+   If the odd bytes (high bytes) are all non-zero printable ASCII, the data
+   is almost certainly just ASCII being misread as UTF-16 -- reject it. */
 static BOOL TryUtf16(const BYTE *d, DWORD sz, wchar_t *out, int outChars)
 {
-    if(sz < 2) return FALSE;
-    /* Round down to even */
+    if(sz < 4) return FALSE;          /* need at least 2 chars to be confident */
+    if((sz & 1)) return FALSE;        /* must be even */
+
     DWORD bytes = sz & ~1u;
     DWORD chars = bytes / 2;
     if(chars >= (DWORD)outChars) chars = outChars - 1;
 
-    /* Copy into aligned buffer before reading as wchar_t */
+    /* Count how many odd bytes (high bytes) are zero vs printable ASCII.
+       Real UTF-16LE western text: high bytes are mostly 0x00.
+       ASCII-misread-as-UTF16: high bytes are printable ASCII chars (0x20-0x7E). */
+    DWORD checkChars = chars < 32 ? chars : 32;
+    int highZero   = 0;   /* high byte == 0x00 */
+    int highAscii  = 0;   /* high byte is printable ASCII (0x20-0x7E) */
+    for(DWORD i = 0; i < checkChars; i++){
+        BYTE lo = d[i*2];
+        BYTE hi = d[i*2+1];
+        if(lo == 0) break;            /* hit null terminator */
+        if(hi == 0x00) highZero++;
+        else if(hi >= 0x20 && hi < 0x7F) highAscii++;
+    }
+    /* If more high bytes are printable ASCII than zero, it's plain ASCII data */
+    if(highAscii > highZero) return FALSE;
+    /* Require at least some zero high bytes to be confident it is UTF-16 */
+    if(highZero == 0) return FALSE;
+
+    /* Copy into aligned buffer and validate */
     memcpy(out, d, chars * 2);
     out[chars] = 0;
 
-    /* Validate: every char up to first null must be printable */
     int good = 0;
     for(DWORD i = 0; i < chars; i++){
         wchar_t c = out[i];
         if(c == 0) break;
         if(c >= 0x20 && c < 0x7F){ good++; continue; }
-        if(c >= 0x80){ good++; continue; }  /* Unicode -- allow */
-        /* Control char -- not a valid string */
+        if(c >= 0x80){ good++; continue; }
         out[0] = 0;
         return FALSE;
     }
     if(good == 0){ out[0] = 0; return FALSE; }
 
-    /* Trim trailing nulls */
     for(int i = (int)chars - 1; i >= 0 && out[i] == 0; i--) out[i] = 0;
     return out[0] != 0;
 }
@@ -1999,7 +2019,6 @@ static void ParseEventData(HTREEITEM hEv, UINT32 evType,
        Variable; may contain a "Spec ID Event" header or StartupLocality */
     case 0x00000003:
         if(sz >= 16){
-            wchar_t str[32]={0};
             /* Check for "Spec ID Event03" or "StartupLocality" */
             if(sz >= 15 && memcmp(d,"Spec ID Event03",15)==0){
                 /* specVersion at offset 24+: major(1)+minor(1)+errata(1) */
@@ -2508,6 +2527,397 @@ static void LoadSSH(HTREEITEM hRoot)
 /* ═══════════════════════════════════════════════════════════
    Cert Store
    ══════════════════════════════════════════════════════════ */
+/* ── Expiry colour: red if expired, orange if within 60 days ── */
+static int CertExpiryColor(const FILETIME *notAfter)
+{
+    FILETIME now; GetSystemTimeAsFileTime(&now);
+    ULONGLONG nowU  = ((ULONGLONG)now.dwHighDateTime     <<32)|now.dwLowDateTime;
+    ULONGLONG expU  = ((ULONGLONG)notAfter->dwHighDateTime<<32)|notAfter->dwLowDateTime;
+    if(nowU >= expU) return COL_BAD;
+    /* 60 days in 100-ns units */
+    if(expU - nowU < (ULONGLONG)60*24*3600*10000000ULL) return COL_WARN;
+    return COL_GOOD;
+}
+
+/* ── Decode a single OID to a friendly name ─────────────── */
+static void OidFriendly(LPCSTR oid, wchar_t *out, int outChars)
+{
+    /* Try Windows built-in name first */
+    PCCRYPT_OID_INFO info = CryptFindOIDInfo(CRYPT_OID_INFO_OID_KEY,
+                                              (void*)oid, 0);
+    if(info && info->pwszName){
+        wcsncpy(out, info->pwszName, outChars-1);
+        return;
+    }
+    /* Fall back to raw OID string */
+    MultiByteToWideChar(CP_ACP, 0, oid, -1, out, outChars-1);
+}
+
+/* ── Parse Subject Alternative Names extension ──────────── */
+static void AddSANs(HTREEITEM hParent, PCCERT_CONTEXT px)
+{
+    PCERT_EXTENSION ext = CertFindExtension(
+        szOID_SUBJECT_ALT_NAME2,
+        px->pCertInfo->cExtension,
+        px->pCertInfo->rgExtension);
+    if(!ext) ext = CertFindExtension(
+        szOID_SUBJECT_ALT_NAME,
+        px->pCertInfo->cExtension,
+        px->pCertInfo->rgExtension);
+    if(!ext) return;
+
+    DWORD cb = 0;
+    CryptDecodeObjectEx(X509_ASN_ENCODING, X509_ALTERNATE_NAME,
+                        ext->Value.pbData, ext->Value.cbData,
+                        CRYPT_DECODE_ALLOC_FLAG, NULL, NULL, &cb);
+    if(!cb) return;
+
+    CERT_ALT_NAME_INFO *san = NULL;
+    if(!CryptDecodeObjectEx(X509_ASN_ENCODING, X509_ALTERNATE_NAME,
+                             ext->Value.pbData, ext->Value.cbData,
+                             CRYPT_DECODE_ALLOC_FLAG, NULL, &san, &cb))
+        return;
+
+    HTREEITEM hSAN = ADD(hParent, L"Subject Alternative Names:", 2, COL_DEFAULT);
+    for(DWORD i = 0; i < san->cAltEntry; i++){
+        CERT_ALT_NAME_ENTRY *e = &san->rgAltEntry[i];
+        wchar_t lbl[512];
+        switch(e->dwAltNameChoice){
+        case CERT_ALT_NAME_DNS_NAME:
+            swprintf_s(lbl,511,L"DNS: %s", e->pwszDNSName);
+            ADD(hSAN,lbl,2,COL_DEFAULT); break;
+        case CERT_ALT_NAME_RFC822_NAME:
+            swprintf_s(lbl,511,L"Email: %s", e->pwszRfc822Name);
+            ADD(hSAN,lbl,2,COL_DEFAULT); break;
+        case CERT_ALT_NAME_URL:
+            swprintf_s(lbl,511,L"URL: %s", e->pwszURL);
+            ADD(hSAN,lbl,2,COL_DEFAULT); break;
+        case CERT_ALT_NAME_IP_ADDRESS:
+            if(e->IPAddress.cbData==4){
+                BYTE *ip=e->IPAddress.pbData;
+                swprintf_s(lbl,511,L"IP: %u.%u.%u.%u",ip[0],ip[1],ip[2],ip[3]);
+            } else if(e->IPAddress.cbData==16){
+                BYTE *ip=e->IPAddress.pbData;
+                swprintf_s(lbl,511,
+                    L"IPv6: %02X%02X:%02X%02X:%02X%02X:%02X%02X:"
+                    L"%02X%02X:%02X%02X:%02X%02X:%02X%02X",
+                    ip[0],ip[1],ip[2],ip[3],ip[4],ip[5],ip[6],ip[7],
+                    ip[8],ip[9],ip[10],ip[11],ip[12],ip[13],ip[14],ip[15]);
+            } else { wcscpy(lbl,L"IP: (unknown format)"); }
+            ADD(hSAN,lbl,2,COL_DEFAULT); break;
+        default:
+            swprintf_s(lbl,511,L"(type %u)",e->dwAltNameChoice);
+            ADD(hSAN,lbl,2,COL_DEFAULT); break;
+        }
+    }
+    LocalFree(san);
+}
+
+/* ── Parse Extended Key Usage extension ─────────────────── */
+static void AddEKUs(HTREEITEM hParent, PCCERT_CONTEXT px)
+{
+    DWORD cb = 0;
+    if(!CertGetEnhancedKeyUsage(px, 0, NULL, &cb) || cb == 0) return;
+    CERT_ENHKEY_USAGE *eku = (CERT_ENHKEY_USAGE*)malloc(cb);
+    if(!eku) return;
+    if(!CertGetEnhancedKeyUsage(px, 0, eku, &cb) || eku->cUsageIdentifier == 0){
+        free(eku); return;
+    }
+    HTREEITEM hEKU = ADD(hParent, L"Extended Key Usage:", 2, COL_DEFAULT);
+    for(DWORD i = 0; i < eku->cUsageIdentifier; i++){
+        wchar_t name[256]={0};
+        OidFriendly(eku->rgpszUsageIdentifier[i], name, 255);
+        wchar_t lbl[384];
+        swprintf_s(lbl,383,L"%s",name);
+        ADD(hEKU,lbl,2,COL_DEFAULT);
+    }
+    free(eku);
+}
+
+/* ── Parse CRL Distribution Points ──────────────────────── */
+static void AddCDPs(HTREEITEM hParent, PCCERT_CONTEXT px)
+{
+    PCERT_EXTENSION ext = CertFindExtension(
+        szOID_CRL_DIST_POINTS,
+        px->pCertInfo->cExtension,
+        px->pCertInfo->rgExtension);
+    if(!ext) return;
+
+    DWORD cb = 0;
+    CRL_DIST_POINTS_INFO *cdp = NULL;
+    if(!CryptDecodeObjectEx(X509_ASN_ENCODING, X509_CRL_DIST_POINTS,
+                             ext->Value.pbData, ext->Value.cbData,
+                             CRYPT_DECODE_ALLOC_FLAG, NULL, &cdp, &cb))
+        return;
+
+    HTREEITEM hCDP = ADD(hParent, L"CRL Distribution Points:", 2, COL_DEFAULT);
+    for(DWORD i = 0; i < cdp->cDistPoint && i < 4; i++){
+        CRL_DIST_POINT *dp = &cdp->rgDistPoint[i];
+        if(dp->DistPointName.dwDistPointNameChoice == CRL_DIST_POINT_FULL_NAME){
+            for(DWORD j = 0; j < dp->DistPointName.FullName.cAltEntry; j++){
+                CERT_ALT_NAME_ENTRY *e = &dp->DistPointName.FullName.rgAltEntry[j];
+                if(e->dwAltNameChoice == CERT_ALT_NAME_URL){
+                    ADD(hCDP, e->pwszURL, 2, COL_DEFAULT);
+                }
+            }
+        }
+    }
+    LocalFree(cdp);
+}
+
+/* ── Parse Authority Information Access (OCSP / CA Issuer) ─ */
+static void AddAIA(HTREEITEM hParent, PCCERT_CONTEXT px)
+{
+    PCERT_EXTENSION ext = CertFindExtension(
+        szOID_AUTHORITY_INFO_ACCESS,
+        px->pCertInfo->cExtension,
+        px->pCertInfo->rgExtension);
+    if(!ext) return;
+
+    DWORD cb = 0;
+    CERT_AUTHORITY_INFO_ACCESS *aia = NULL;
+    if(!CryptDecodeObjectEx(X509_ASN_ENCODING, X509_AUTHORITY_INFO_ACCESS,
+                             ext->Value.pbData, ext->Value.cbData,
+                             CRYPT_DECODE_ALLOC_FLAG, NULL, &aia, &cb))
+        return;
+
+    for(DWORD i = 0; i < aia->cAccDescr; i++){
+        CERT_ACCESS_DESCRIPTION *ad = &aia->rgAccDescr[i];
+        if(ad->AccessLocation.dwAltNameChoice != CERT_ALT_NAME_URL) continue;
+        wchar_t lbl[512];
+        if(strcmp(ad->pszAccessMethod, szOID_PKIX_OCSP) == 0)
+            swprintf_s(lbl,511,L"OCSP: %s", ad->AccessLocation.pwszURL);
+        else if(strcmp(ad->pszAccessMethod, szOID_PKIX_CA_ISSUERS) == 0)
+            swprintf_s(lbl,511,L"CA Issuers: %s", ad->AccessLocation.pwszURL);
+        else
+            swprintf_s(lbl,511,L"AIA: %s", ad->AccessLocation.pwszURL);
+        ADD(hParent, lbl, 2, COL_DEFAULT);
+    }
+    LocalFree(aia);
+}
+
+/* ── Full certificate detail node ───────────────────────── */
+static void AddCertDetail(HTREEITEM hParent, PCCERT_CONTEXT px)
+{
+    wchar_t lbl[512];
+
+    /* ── SHA-1 thumbprint (with expiry colour) ── */
+    BYTE th[20]; DWORD tsz=20;
+    int expiryCol = CertExpiryColor(&px->pCertInfo->NotAfter);
+    if(CryptHashCertificate(0,CALG_SHA1,0,
+                             px->pbCertEncoded,px->cbCertEncoded,th,&tsz)){
+        wchar_t hex[48]={0};
+        for(DWORD i=0;i<tsz;i++) swprintf_s(hex+i*2,3,L"%02X",th[i]);
+        swprintf_s(lbl,511,L"SHA-1: %s",hex);
+        ADD(hParent,lbl,2,COL_DEFAULT);
+    }
+
+    /* ── SHA-256 thumbprint ── */
+    {
+        HCRYPTPROV hProv=0; HCRYPTHASH hHash=0;
+        if(CryptAcquireContextW(&hProv,NULL,NULL,PROV_RSA_AES,CRYPT_VERIFYCONTEXT)){
+            if(CryptCreateHash(hProv,CALG_SHA_256,0,0,&hHash)){
+                CryptHashData(hHash,px->pbCertEncoded,px->cbCertEncoded,0);
+                BYTE d[32]; DWORD dl=32;
+                if(CryptGetHashParam(hHash,HP_HASHVAL,d,&dl,0)){
+                    wchar_t hex[68]={0};
+                    for(DWORD i=0;i<dl;i++) swprintf_s(hex+i*2,3,L"%02X",d[i]);
+                    swprintf_s(lbl,511,L"SHA-256: %s",hex);
+                    ADD(hParent,lbl,2,COL_DEFAULT);
+                }
+                CryptDestroyHash(hHash);
+            }
+            CryptReleaseContext(hProv,0);
+        }
+    }
+
+    /* ── Full subject DN ── */
+    wchar_t dn[512]=L"";
+    CertGetNameStringW(px,CERT_NAME_RDN_TYPE,0,NULL,dn,511);
+    if(dn[0]){ swprintf_s(lbl,511,L"Subject DN: %s",dn); ADD(hParent,lbl,2,COL_DEFAULT); }
+
+    /* ── Full issuer DN ── */
+    wchar_t idn[512]=L"";
+    CertGetNameStringW(px,CERT_NAME_RDN_TYPE,CERT_NAME_ISSUER_FLAG,NULL,idn,511);
+    if(idn[0]){ swprintf_s(lbl,511,L"Issuer DN: %s",idn); ADD(hParent,lbl,2,COL_DEFAULT); }
+
+    /* ── Serial number ── */
+    {
+        DWORD snLen=px->pCertInfo->SerialNumber.cbData;
+        if(snLen>0&&snLen<=32){
+            wchar_t snHex[72]={0};
+            for(DWORD b=0;b<snLen;b++)
+                swprintf_s(snHex+b*2,3,L"%02X",
+                    px->pCertInfo->SerialNumber.pbData[snLen-1-b]);
+            swprintf_s(lbl,511,L"Serial: %s",snHex);
+            ADD(hParent,lbl,2,COL_DEFAULT);
+        }
+    }
+
+    /* ── Validity with expiry colour ── */
+    {
+        SYSTEMTIME nb,na;
+        FileTimeToSystemTime(&px->pCertInfo->NotBefore,&nb);
+        FileTimeToSystemTime(&px->pCertInfo->NotAfter,&na);
+        swprintf_s(lbl,511,L"Valid: %04d-%02d-%02d \u2192 %04d-%02d-%02d",
+            nb.wYear,nb.wMonth,nb.wDay,na.wYear,na.wMonth,na.wDay);
+        /* Append expiry status */
+        FILETIME now; GetSystemTimeAsFileTime(&now);
+        ULONGLONG nowU=((ULONGLONG)now.dwHighDateTime<<32)|now.dwLowDateTime;
+        ULONGLONG expU=((ULONGLONG)px->pCertInfo->NotAfter.dwHighDateTime<<32)
+                        |px->pCertInfo->NotAfter.dwLowDateTime;
+        if(nowU>=expU)
+            wcscat(lbl,L"  \u274C EXPIRED");
+        else {
+            ULONGLONG days=(expU-nowU)/(10000000ULL*86400ULL);
+            if(days<=60){
+                wchar_t warn[32]; swprintf_s(warn,31,L"  \u26A0 expires in %I64u days",(ULONGLONG)days);
+                wcscat(lbl,warn);
+            } else {
+                wchar_t ok[32]; swprintf_s(ok,31,L"  \u2714 (%I64u days left)",(ULONGLONG)days);
+                wcscat(lbl,ok);
+            }
+        }
+        ADD(hParent,lbl,2,expiryCol);
+    }
+
+    /* ── Public key algorithm + size ── */
+    {
+        wchar_t pkAlg[128]=L"";
+        if(px->pCertInfo->SubjectPublicKeyInfo.Algorithm.pszObjId){
+            OidFriendly(px->pCertInfo->SubjectPublicKeyInfo.Algorithm.pszObjId,
+                        pkAlg,127);
+        }
+        DWORD keyBits=0;
+        DWORD cbPub=0;
+        /* Try RSA first */
+        if(CryptDecodeObject(X509_ASN_ENCODING,RSA_CSP_PUBLICKEYBLOB,
+            px->pCertInfo->SubjectPublicKeyInfo.PublicKey.pbData,
+            px->pCertInfo->SubjectPublicKeyInfo.PublicKey.cbData,
+            0,NULL,&cbPub)&&cbPub>=16){
+            BYTE *blob=(BYTE*)malloc(cbPub);
+            if(blob){
+                if(CryptDecodeObject(X509_ASN_ENCODING,RSA_CSP_PUBLICKEYBLOB,
+                    px->pCertInfo->SubjectPublicKeyInfo.PublicKey.pbData,
+                    px->pCertInfo->SubjectPublicKeyInfo.PublicKey.cbData,
+                    0,blob,&cbPub))
+                    keyBits=*(DWORD*)(blob+12);
+                free(blob);
+            }
+        }
+        if(keyBits)
+            swprintf_s(lbl,511,L"Public key: %s  %u bits",pkAlg[0]?pkAlg:L"?",keyBits);
+        else
+            swprintf_s(lbl,511,L"Public key: %s",pkAlg[0]?pkAlg:L"?");
+        ADD(hParent,lbl,1,COL_HARDWARE);
+    }
+
+    /* ── Key usage ── */
+    {
+        BYTE ku=0;
+        if(CertGetIntendedKeyUsage(X509_ASN_ENCODING,px->pCertInfo,&ku,1)&&ku){
+            wchar_t kuStr[256]=L"Key usage:";
+            if(ku&CERT_DIGITAL_SIGNATURE_KEY_USAGE) wcscat(kuStr,L" DigitalSignature");
+            if(ku&CERT_NON_REPUDIATION_KEY_USAGE)   wcscat(kuStr,L" NonRepudiation");
+            if(ku&CERT_KEY_ENCIPHERMENT_KEY_USAGE)  wcscat(kuStr,L" KeyEncipherment");
+            if(ku&CERT_DATA_ENCIPHERMENT_KEY_USAGE) wcscat(kuStr,L" DataEncipherment");
+            if(ku&CERT_KEY_AGREEMENT_KEY_USAGE)     wcscat(kuStr,L" KeyAgreement");
+            if(ku&CERT_KEY_CERT_SIGN_KEY_USAGE)     wcscat(kuStr,L" CertSign");
+            if(ku&CERT_CRL_SIGN_KEY_USAGE)          wcscat(kuStr,L" CRLSign");
+            ADD(hParent,kuStr,2,COL_DEFAULT);
+        }
+    }
+
+    /* ── Extended Key Usage ── */
+    AddEKUs(hParent, px);
+
+    /* ── Subject Alternative Names ── */
+    AddSANs(hParent, px);
+
+    /* ── Basic Constraints ── */
+    {
+        PCERT_EXTENSION ext = CertFindExtension(
+            szOID_BASIC_CONSTRAINTS2,
+            px->pCertInfo->cExtension,
+            px->pCertInfo->rgExtension);
+        if(!ext) ext = CertFindExtension(
+            szOID_BASIC_CONSTRAINTS,
+            px->pCertInfo->cExtension,
+            px->pCertInfo->rgExtension);
+        if(ext){
+            DWORD cb=0; CERT_BASIC_CONSTRAINTS2_INFO *bc=NULL;
+            if(CryptDecodeObjectEx(X509_ASN_ENCODING,X509_BASIC_CONSTRAINTS2,
+                                    ext->Value.pbData,ext->Value.cbData,
+                                    CRYPT_DECODE_ALLOC_FLAG,NULL,&bc,&cb)){
+                if(bc->fCA){
+                    if(bc->fPathLenConstraint)
+                        swprintf_s(lbl,511,L"CA: YES  (path length \u2264 %u)",
+                                   bc->dwPathLenConstraint);
+                    else
+                        wcscpy(lbl,L"CA: YES  (no path length constraint)");
+                    ADD(hParent,lbl,3,COL_HARDWARE);
+                } else {
+                    ADD(hParent,L"CA: NO  (end-entity certificate)",2,COL_DEFAULT);
+                }
+                LocalFree(bc);
+            }
+        }
+    }
+
+    /* ── OCSP / CA Issuers ── */
+    AddAIA(hParent, px);
+
+    /* ── CRL Distribution Points ── */
+    AddCDPs(hParent, px);
+
+    /* ── Subject Key Identifier ── */
+    {
+        PCERT_EXTENSION ext = CertFindExtension(
+            szOID_SUBJECT_KEY_IDENTIFIER,
+            px->pCertInfo->cExtension,
+            px->pCertInfo->rgExtension);
+        if(ext){
+            DWORD cb=0; CRYPT_DATA_BLOB *ski=NULL;
+            if(CryptDecodeObjectEx(X509_ASN_ENCODING,szOID_SUBJECT_KEY_IDENTIFIER,
+                                    ext->Value.pbData,ext->Value.cbData,
+                                    CRYPT_DECODE_ALLOC_FLAG,NULL,&ski,&cb)){
+                wchar_t hex[64]={0};
+                DWORD show=ski->cbData<20?ski->cbData:20;
+                for(DWORD i=0;i<show;i++) swprintf_s(hex+i*2,3,L"%02X",ski->pbData[i]);
+                swprintf_s(lbl,511,L"Subject Key ID: %s",hex);
+                ADD(hParent,lbl,2,COL_DEFAULT);
+                LocalFree(ski);
+            }
+        }
+    }
+
+    /* ── Signature algorithm ── */
+    {
+        wchar_t sigAlg[128]=L"";
+        if(px->pCertInfo->SignatureAlgorithm.pszObjId)
+            OidFriendly(px->pCertInfo->SignatureAlgorithm.pszObjId,sigAlg,127);
+        if(sigAlg[0]){
+            swprintf_s(lbl,511,L"Signature alg: %s",sigAlg);
+            ADD(hParent,lbl,2,COL_DEFAULT);
+        }
+    }
+
+    /* ── Has private key? ── */
+    {
+        HCRYPTPROV_OR_NCRYPT_KEY_HANDLE hKey=0; DWORD keySpec=0; BOOL fFree=FALSE;
+        if(CryptAcquireCertificatePrivateKey(px,
+                CRYPT_ACQUIRE_SILENT_FLAG|CRYPT_ACQUIRE_ALLOW_NCRYPT_KEY_FLAG,
+                NULL,&hKey,&keySpec,&fFree)){
+            ADD(hParent,L"Private key: YES  \u2714  (key pair present in this store)",
+                3,COL_GOOD);
+            if(fFree){
+                if(keySpec==CERT_NCRYPT_KEY_SPEC) NCryptFreeObject(hKey);
+                else CryptReleaseContext(hKey,0);
+            }
+        }
+    }
+}
+
 static void LoadCerts(HTREEITEM hRoot)
 {
     struct{const wchar_t *id,*lbl;}st[]={
@@ -2517,29 +2927,32 @@ static void LoadCerts(HTREEITEM hRoot)
         HCERTSTORE hSt=CertOpenSystemStoreW(0,st[s].id);
         if(!hSt) continue;
         HTREEITEM hSN=ADD(hC,st[s].lbl,0,COL_DEFAULT);
-        PCCERT_CONTEXT px=NULL; int cnt=0; wchar_t lbl[512];
+        PCCERT_CONTEXT px=NULL; int cnt=0;
         while((px=CertEnumCertificatesInStore(hSt,px))){
             BYTE ku=0;
             BOOL hku=CertGetIntendedKeyUsage(X509_ASN_ENCODING,px->pCertInfo,&ku,1);
             if(hku&&!(ku&(CERT_DIGITAL_SIGNATURE_KEY_USAGE|
                            CERT_KEY_CERT_SIGN_KEY_USAGE|CERT_CRL_SIGN_KEY_USAGE))) continue;
+
+            /* Subject name as node label */
             wchar_t sj[256]=L"?";
             CertGetNameStringW(px,CERT_NAME_SIMPLE_DISPLAY_TYPE,0,NULL,sj,255);
-            HTREEITEM hCC=ADD(hSN,sj,1,COL_DEFAULT);
-            BYTE th[20];DWORD tsz=20;
-            if(CryptHashCertificate(0,CALG_SHA1,0,px->pbCertEncoded,px->cbCertEncoded,th,&tsz)){
-                wchar_t hex[48]={0};
-                for(DWORD i=0;i<tsz;i++) swprintf_s(hex+i*2,3,L"%02X",th[i]);
-                swprintf_s(lbl,511,L"Thumbprint: %s",hex);ADD(hCC,lbl,2,COL_DEFAULT);}
+
+            /* Expiry colour for the node itself */
+            int col = CertExpiryColor(&px->pCertInfo->NotAfter);
+            HTREEITEM hCC = ADD(hSN,sj,1,col);
+
+            /* Issuer name directly under node (quick glance) */
             wchar_t iss[256]=L"?";
-            CertGetNameStringW(px,CERT_NAME_SIMPLE_DISPLAY_TYPE,CERT_NAME_ISSUER_FLAG,NULL,iss,255);
-            swprintf_s(lbl,511,L"Issuer: %s",iss);ADD(hCC,lbl,2,COL_DEFAULT);
-            SYSTEMTIME nb,na;
-            FileTimeToSystemTime(&px->pCertInfo->NotBefore,&nb);
-            FileTimeToSystemTime(&px->pCertInfo->NotAfter,&na);
-            swprintf_s(lbl,511,L"Valid: %04d-%02d-%02d \u2192 %04d-%02d-%02d",
-                nb.wYear,nb.wMonth,nb.wDay,na.wYear,na.wMonth,na.wDay);
-            ADD(hCC,lbl,2,COL_DEFAULT);
+            CertGetNameStringW(px,CERT_NAME_SIMPLE_DISPLAY_TYPE,
+                               CERT_NAME_ISSUER_FLAG,NULL,iss,255);
+            wchar_t issLbl[280];
+            swprintf_s(issLbl,279,L"Issuer: %s",iss);
+            ADD(hCC,issLbl,2,COL_DEFAULT);
+
+            /* All the rich detail */
+            AddCertDetail(hCC, px);
+
             cnt++;
         }
         CertCloseStore(hSt,0);

@@ -3,7 +3,7 @@
 git add --all
 
 set "MSG=%~1"
-if "%MSG%"=="" set "MSG=info in pcr events"
+if "%MSG%"=="" set "MSG=more cert info and fix garbage data in EV_EFI_HCRTM_EVENT"
 
 git status
 
