@@ -3,7 +3,7 @@
 git add --all
 
 set "MSG=%~1"
-if "%MSG%"=="" set "MSG=UX improvements"
+if "%MSG%"=="" set "MSG=info in pcr events"
 
 git status
 

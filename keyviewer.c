@@ -1485,6 +1485,607 @@ static const wchar_t *FriendlyEfiVarGuid(const BYTE *guid16)
     return NULL;
 }
 
+/* ── Helpers ─────────────────────────────────────────────── */
+
+/* Format a GUID (mixed-endian EFI style) as the standard string */
+static void FmtGuid(const BYTE *g, wchar_t *out, int outLen)
+{
+    swprintf_s(out, outLen,
+        L"{%02X%02X%02X%02X-%02X%02X-%02X%02X-%02X%02X-%02X%02X%02X%02X%02X%02X}",
+        g[3],g[2],g[1],g[0], g[5],g[4], g[7],g[6],
+        g[8],g[9], g[10],g[11],g[12],g[13],g[14],g[15]);
+}
+
+/* Attempt to render bytes as a UTF-16LE string; returns TRUE on success */
+static BOOL TryUtf16(const BYTE *d, DWORD sz, wchar_t *out, int outChars)
+{
+    if(sz < 2) return FALSE;
+    /* Round down to even */
+    DWORD bytes = sz & ~1u;
+    DWORD chars = bytes / 2;
+    if(chars >= (DWORD)outChars) chars = outChars - 1;
+
+    /* Copy into aligned buffer before reading as wchar_t */
+    memcpy(out, d, chars * 2);
+    out[chars] = 0;
+
+    /* Validate: every char up to first null must be printable */
+    int good = 0;
+    for(DWORD i = 0; i < chars; i++){
+        wchar_t c = out[i];
+        if(c == 0) break;
+        if(c >= 0x20 && c < 0x7F){ good++; continue; }
+        if(c >= 0x80){ good++; continue; }  /* Unicode -- allow */
+        /* Control char -- not a valid string */
+        out[0] = 0;
+        return FALSE;
+    }
+    if(good == 0){ out[0] = 0; return FALSE; }
+
+    /* Trim trailing nulls */
+    for(int i = (int)chars - 1; i >= 0 && out[i] == 0; i--) out[i] = 0;
+    return out[0] != 0;
+}
+
+/* Attempt to render bytes as UTF-8/ASCII; returns TRUE on success.
+   Accepts null-terminated strings -- stops at the first null. */
+static BOOL TryAscii(const BYTE *d, DWORD sz, wchar_t *out, int outChars)
+{
+    if(sz == 0) return FALSE;
+    if(d[0] < 0x20 || d[0] >= 0x7F) return FALSE;
+
+    /* Find length up to null or limit */
+    DWORD len = 0;
+    DWORD limit = sz < (DWORD)(outChars - 1) ? sz : (DWORD)(outChars - 1);
+    while(len < limit && d[len] != 0){
+        if(d[len] < 0x20 || d[len] >= 0x7F) return FALSE;
+        len++;
+    }
+    if(len == 0) return FALSE;
+
+    MultiByteToWideChar(CP_UTF8, 0, (char*)d, (int)len, out, outChars - 1);
+    out[outChars - 1] = 0;
+    return out[0] != 0;
+}
+
+/* Emit a hex dump as child nodes under hParent, 16 bytes per row */
+static void AddHexDump(HTREEITEM hParent, const BYTE *d, DWORD sz,
+                        const wchar_t *prefix)
+{
+    DWORD show = sz < 128 ? sz : 128;
+    for(DWORD row = 0; row < show; row += 16){
+        DWORD rowLen = (show - row < 16) ? show - row : 16;
+        wchar_t hex[56] = {0}, asc[20] = {0};
+        for(DWORD b = 0; b < rowLen; b++){
+            swprintf_s(hex + b*3, 4, L"%02X ", d[row+b]);
+            asc[b] = (d[row+b] >= 0x20 && d[row+b] < 0x7F) ? d[row+b] : L'.';
+        }
+        wchar_t lbl[128];
+        swprintf_s(lbl, 127, L"%s%04X:  %-48s  %s",
+                   prefix ? prefix : L"", row, hex, asc);
+        ADD(hParent, lbl, 2, COL_DEFAULT);
+    }
+    if(sz > 128){
+        wchar_t lbl[64];
+        swprintf_s(lbl, 63, L"  … (%u bytes total, showing first 128)", sz);
+        ADD(hParent, lbl, 2, COL_DEFAULT);
+    }
+}
+
+/* ── Known EFI Image Load device path node types ────────── */
+static const wchar_t *DpTypeName(BYTE type, BYTE sub)
+{
+    if(type==2 && sub==1)  return L"PCI";
+    if(type==2 && sub==3)  return L"USB";
+    if(type==2 && sub==18) return L"NVMe";
+    if(type==2 && sub==23) return L"UFS";
+    if(type==3 && sub==1)  return L"Generic FS";
+    if(type==3 && sub==4)  return L"File Path";
+    if(type==4 && sub==1)  return L"ACPI";
+    if(type==4 && sub==3)  return L"Expanded ACPI";
+    if(type==2 && sub==26) return L"SATA";
+    if(type==2 && sub==8)  return L"Infiniband";
+    if(type==2 && sub==12) return L"SCSI";
+    if(type==2 && sub==4)  return L"IDE";
+    if(type==2 && sub==22) return L"SAS";
+    if(type==5 && sub==1)  return L"BIOS Boot";
+    return NULL;
+}
+
+/* ═══════════════════════════════════════════════════════════
+   ParseEventData — adds rich child nodes to hEv based on evType
+   ══════════════════════════════════════════════════════════ */
+static void ParseEventData(HTREEITEM hEv, UINT32 evType,
+                            const BYTE *d, DWORD sz)
+{
+    wchar_t lbl[512];
+
+    switch(evType){
+
+    /* ── EV_EVENT_TAG  (0x06) ─────────────────────────────
+       TCG PC Client FPT §10.4.5
+       Layout: taggedEventDataSize(4) + tagId(4) + tagDataSize(4) + tagData(N) */
+    case 0x00000006:
+        if(sz >= 12){
+            DWORD tagId       = *(DWORD*)(d+4);
+            DWORD tagDataSize = *(DWORD*)(d+8);
+            swprintf_s(lbl,511,L"Tag ID: 0x%08X",tagId);
+            ADD(hEv,lbl,2,COL_DEFAULT);
+            swprintf_s(lbl,511,L"Tag data size: %u bytes",tagDataSize);
+            ADD(hEv,lbl,2,COL_DEFAULT);
+            if(tagDataSize > 0 && sz >= 12 + tagDataSize){
+                const BYTE *td = d + 12;
+                wchar_t str[256]={0};
+                if(TryUtf16(td, tagDataSize, str, 255) ||
+                   TryAscii(td, tagDataSize, str, 255)){
+                    swprintf_s(lbl,511,L"Tag data: \"%s\"",str);
+                    ADD(hEv,lbl,2,COL_HARDWARE);
+                } else {
+                    HTREEITEM hDump = ADD(hEv,L"Tag data (hex):",2,COL_DEFAULT);
+                    AddHexDump(hDump,td,tagDataSize,L"");
+                }
+            }
+        } else {
+            AddHexDump(hEv,d,sz,L"");
+        }
+        break;
+
+    /* ── EV_POST_CODE  (0x01) ─────────────────────────────
+       Usually a string ("ACPI DATA", "SMBIOS", etc.) or a blob address */
+    case 0x00000001:
+        if(sz > 0){
+            wchar_t str[256]={0};
+            if(TryAscii(d,sz,str,255)){
+                swprintf_s(lbl,511,L"POST code: \"%s\"",str);
+                ADD(hEv,lbl,2,COL_HARDWARE);
+            } else if(sz == 8){
+                UINT64 addr = *(UINT64*)d;
+                swprintf_s(lbl,511,L"Address: 0x%016I64X",addr);
+                ADD(hEv,lbl,2,COL_DEFAULT);
+            } else if(sz == 16){
+                UINT64 base = *(UINT64*)d;
+                UINT64 len  = *(UINT64*)(d+8);
+                swprintf_s(lbl,511,L"Base: 0x%016I64X",base);
+                ADD(hEv,lbl,2,COL_DEFAULT);
+                swprintf_s(lbl,511,L"Length: 0x%I64X (%I64u bytes)",len,len);
+                ADD(hEv,lbl,2,COL_DEFAULT);
+            } else {
+                AddHexDump(hEv,d,sz,L"");
+            }
+        }
+        break;
+
+    /* ── EV_S_CRTM_VERSION  (0x08) ───────────────────────
+       Spec says UTF-16LE string, but many firmware implementations
+       store a GUID (16 bytes) identifying the CRTM instead.
+       Handle both. */
+    case 0x00000008:{
+        wchar_t str[256]={0};
+        if(sz == 16){
+            /* GUID form */
+            FmtGuid(d, str, 255);
+            swprintf_s(lbl,511,L"CRTM GUID: %s",str);
+            ADD(hEv,lbl,2,COL_HARDWARE);
+        } else if(TryUtf16(d,sz,str,255)){
+            swprintf_s(lbl,511,L"CRTM version: \"%s\"",str);
+            ADD(hEv,lbl,2,COL_HARDWARE);
+        } else if(TryAscii(d,sz,str,255)){
+            swprintf_s(lbl,511,L"CRTM version: \"%s\"",str);
+            ADD(hEv,lbl,2,COL_HARDWARE);
+        } else {
+            /* Unknown format — show hex */
+            AddHexDump(hEv,d,sz,L"");
+        }
+        break;
+    }
+
+    /* ── EV_S_CRTM_CONTENTS  (0x07) ──────────────────────
+       UEFI_PLATFORM_FIRMWARE_BLOB: base(8) + length(8) */
+    case 0x00000007:
+        if(sz >= 16){
+            UINT64 base = *(UINT64*)d;
+            UINT64 len  = *(UINT64*)(d+8);
+            swprintf_s(lbl,511,L"Base:   0x%016I64X",base);  ADD(hEv,lbl,2,COL_DEFAULT);
+            swprintf_s(lbl,511,L"Length: 0x%I64X (%I64u KB)",len,len/1024); ADD(hEv,lbl,2,COL_DEFAULT);
+        }
+        break;
+
+    /* ── EV_EFI_PLATFORM_FIRMWARE_BLOB  (0x80000004) ─────
+       UEFI_PLATFORM_FIRMWARE_BLOB: base(8) + length(8) */
+    case 0x80000004:
+        if(sz >= 16){
+            UINT64 base = *(UINT64*)d;
+            UINT64 len  = *(UINT64*)(d+8);
+            swprintf_s(lbl,511,L"Base:   0x%016I64X",base);  ADD(hEv,lbl,2,COL_DEFAULT);
+            swprintf_s(lbl,511,L"Length: 0x%I64X (%I64u KB)",len,len/1024); ADD(hEv,lbl,2,COL_DEFAULT);
+        }
+        break;
+
+    /* ── EV_EFI_PLATFORM_FIRMWARE_BLOB2  (0x80000006) ────
+       UEFI_PLATFORM_FIRMWARE_BLOB2: descSize(1) + desc(N) + base(8) + len(8) */
+    case 0x80000006:
+        if(sz >= 1){
+            BYTE descLen = d[0];
+            if((DWORD)1 + descLen + 16 <= sz){
+                wchar_t desc[256]={0};
+                if(TryAscii(d+1, descLen, desc, 255) ||
+                   TryUtf16(d+1, descLen, desc, 255)){
+                    swprintf_s(lbl,511,L"Description: \"%s\"",desc);
+                    ADD(hEv,lbl,2,COL_HARDWARE);
+                }
+                UINT64 base = *(UINT64*)(d+1+descLen);
+                UINT64 len  = *(UINT64*)(d+1+descLen+8);
+                swprintf_s(lbl,511,L"Base:   0x%016I64X",base); ADD(hEv,lbl,2,COL_DEFAULT);
+                swprintf_s(lbl,511,L"Length: 0x%I64X (%I64u KB)",len,len/1024); ADD(hEv,lbl,2,COL_DEFAULT);
+            }
+        }
+        break;
+
+    /* ── EV_EFI_HANDOFF_TABLES  (0x80000003 / 0x8000000E) ─
+       UEFI_HANDOFF_TABLE_POINTERS: count(8) + (guid(16)+addr(8))*N */
+    case 0x80000003:
+    case 0x8000000E:
+        if(sz >= 8){
+            UINT64 count = *(UINT64*)d;
+            if(count > 16) count = 16;
+            swprintf_s(lbl,511,L"Table count: %I64u",count); ADD(hEv,lbl,2,COL_DEFAULT);
+            for(UINT64 i=0; i<count && 8+i*24+24<=(UINT64)sz; i++){
+                const BYTE *entry = d + 8 + i*24;
+                wchar_t guid[64]={0}; FmtGuid(entry,guid,63);
+                UINT64 addr = *(UINT64*)(entry+16);
+                /* Known table GUIDs */
+                static const struct { const BYTE g[16]; const wchar_t *n; } kt[] = {
+                    {{0x18,0xEB,0x4A,0xEB,0x22,0x80,0xD8,0x41,0xBE,0x68,0x28,0x2A,0x40,0xA3,0x7D,0x0B}, L"SMBIOS"},
+                    {{0xEA,0xED,0x21,0xF9,0x1A,0xDE,0x74,0x4E,0xB8,0x44,0x6F,0xA0,0x48,0x25,0xE0,0x19}, L"SMBIOS3"},
+                    {{0xEB,0x9D,0x2D,0x31,0x2D,0x38,0xC3,0x11,0x82,0x18,0x00,0xA0,0xC9,0x69,0x72,0x3B}, L"ACPI 1.0 RSDP"},
+                    {{0x71,0xE8,0x68,0x88,0xF1,0xE4,0xD3,0x11,0xBC,0x22,0x00,0x80,0xC7,0x3C,0x88,0x81}, L"ACPI 2.0+ RSDP"},
+                    {{0x8D,0x59,0xD3,0x26,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00}, L"SAL System Table"},
+                };
+                const wchar_t *name = NULL;
+                for(int k=0;k<5;k++) if(memcmp(entry,kt[k].g,16)==0){ name=kt[k].n; break; }
+                swprintf_s(lbl,511,L"[%I64u] %s  @ 0x%016I64X",
+                    i, name?name:guid, addr);
+                ADD(hEv,lbl,2,name?COL_HARDWARE:COL_DEFAULT);
+            }
+        }
+        break;
+
+    /* ── EV_EFI_HANDOFF_TABLES2  (0x80000005) ────────────
+       UEFI_HANDOFF_TABLE_POINTERS2: descSize(1)+desc(N)+count(8)+(guid+addr)*N */
+    case 0x80000005:
+        if(sz >= 1){
+            BYTE descLen = d[0];
+            if((DWORD)1+descLen+8 <= sz){
+                wchar_t desc[256]={0};
+                TryAscii(d+1,descLen,desc,255);
+                swprintf_s(lbl,511,L"Description: \"%s\"",desc[0]?desc:L"(none)");
+                ADD(hEv,lbl,2,COL_HARDWARE);
+                if((DWORD)1+descLen+8 <= sz){
+                    UINT64 count = *(UINT64*)(d+1+descLen);
+                    swprintf_s(lbl,511,L"Table count: %I64u",count);
+                    ADD(hEv,lbl,2,COL_DEFAULT);
+                }
+            }
+        }
+        break;
+
+    /* ── EV_EFI_VARIABLE_DRIVER_CONFIG / BOOT / AUTHORITY ─
+       (0x80000001 / 0x80000002 / 0x80000010)
+       UEFI_VARIABLE_DATA: guid(16)+nameLen(8)+dataLen(8)+name(nameLen*2)+data */
+    case 0x80000001:
+    case 0x80000002:
+    case 0x80000010:
+        if(sz >= 32){
+            wchar_t guid[64]={0}; FmtGuid(d,guid,63);
+            const wchar_t *gname = FriendlyEfiVarGuid(d);
+            swprintf_s(lbl,511,L"GUID: %s%s%s",
+                gname?gname:L"", gname?L"  ":L"", guid);
+            ADD(hEv,lbl,2,gname?COL_HARDWARE:COL_DEFAULT);
+
+            UINT64 nameLen = *(UINT64*)(d+16);
+            UINT64 dataLen = *(UINT64*)(d+24);
+            if(nameLen>0 && nameLen<128 && 32+nameLen*2 <= (UINT64)sz){
+                wchar_t varName[128]={0};
+                memcpy(varName, d+32, nameLen*2); varName[nameLen]=0;
+                swprintf_s(lbl,511,L"Variable: %s",varName);
+                ADD(hEv,lbl,2,COL_HARDWARE);
+            }
+            swprintf_s(lbl,511,L"Data length: %I64u bytes",dataLen);
+            ADD(hEv,lbl,2,COL_DEFAULT);
+
+            /* For authority events, try to parse as X.509 cert */
+            DWORD dataOff = (DWORD)(32 + nameLen*2);
+            if(evType==0x80000010 && dataLen>=8 && dataOff+dataLen<=sz){
+                /* Authority data is an EFI_SIGNATURE_DATA: owner GUID(16) + cert */
+                if(dataLen > 16){
+                    PCCERT_CONTEXT pc = CertCreateCertificateContext(
+                        X509_ASN_ENCODING|PKCS_7_ASN_ENCODING,
+                        d+dataOff+16, (DWORD)(dataLen-16));
+                    if(pc){
+                        wchar_t subj[256]=L"?";
+                        CertGetNameStringW(pc,CERT_NAME_SIMPLE_DISPLAY_TYPE,0,NULL,subj,255);
+                        swprintf_s(lbl,511,L"Verified by: %s",subj);
+                        ADD(hEv,lbl,1,COL_GOOD);
+                        CertFreeCertificateContext(pc);
+                    }
+                }
+            }
+        }
+        break;
+
+    /* ── EV_EFI_IMAGE_LOAD  (0x8000000D) ─────────────────
+       UEFI_IMAGE_LOAD_EVENT:
+         imageLocationInMemory(8) + lengthInMemory(8) +
+         lengthOfDevicePath(8) + devicePath(N) */
+    case 0x8000000D:
+        if(sz >= 24){
+            UINT64 imgAddr = *(UINT64*)(d+0);
+            UINT64 imgLen  = *(UINT64*)(d+8);
+            UINT64 dpLen   = *(UINT64*)(d+16);
+            swprintf_s(lbl,511,L"Image address: 0x%016I64X",imgAddr); ADD(hEv,lbl,2,COL_DEFAULT);
+            swprintf_s(lbl,511,L"Image length:  0x%I64X (%I64u KB)",imgLen,imgLen/1024); ADD(hEv,lbl,2,COL_DEFAULT);
+            swprintf_s(lbl,511,L"DevicePath length: %I64u bytes",dpLen); ADD(hEv,lbl,2,COL_DEFAULT);
+
+            /* Walk device path nodes */
+            if(dpLen > 0 && 24+dpLen <= (UINT64)sz){
+                HTREEITEM hDP = ADD(hEv,L"Device path:",2,COL_HEADER);
+                const BYTE *dp    = d + 24;
+                const BYTE *dpEnd = dp + dpLen;
+                int nodeIdx = 0;
+                while(dp + 4 <= dpEnd && nodeIdx < 32){
+                    BYTE dpType  = dp[0];
+                    BYTE dpSub   = dp[1];
+                    WORD dpSz    = *(WORD*)(dp+2);
+                    if(dpSz < 4 || dp+dpSz > dpEnd) break;
+                    if(dpType == 0x7F && dpSub == 0xFF) break; /* End of Hardware */
+
+                    const wchar_t *dpName = DpTypeName(dpType,dpSub);
+                    wchar_t dpLbl[256]={0};
+
+                    /* File Path node (type=4 sub=4): UTF-16LE string */
+                    if(dpType==4 && dpSub==4 && dpSz > 4){
+                        wchar_t path[256]={0};
+                        DWORD pathBytes = dpSz - 4;
+                        if(pathBytes/2 < 255){
+                            memcpy(path, dp+4, pathBytes);
+                            path[pathBytes/2]=0;
+                        }
+                        swprintf_s(dpLbl,255,L"File: %s",path);
+                    } else if(dpType==2 && dpSub==18 && dpSz>=28){
+                        /* NVMe: namespace(4)+IEEE EUI-64(8) */
+                        DWORD ns = *(DWORD*)(dp+4);
+                        swprintf_s(dpLbl,255,L"NVMe namespace: 0x%08X",ns);
+                    } else if(dpType==2 && dpSub==1 && dpSz>=6){
+                        /* PCI: function+device */
+                        swprintf_s(dpLbl,255,L"PCI %02X:%02X",dp[5],dp[4]);
+                    } else if(dpName){
+                        swprintf_s(dpLbl,255,L"%s",dpName);
+                    } else {
+                        swprintf_s(dpLbl,255,L"Type %02X/%02X (%u bytes)",
+                                   dpType,dpSub,dpSz-4);
+                    }
+                    ADD(hDP,dpLbl,2,COL_DEFAULT);
+                    dp += dpSz;
+                    nodeIdx++;
+                }
+            }
+        }
+        break;
+
+    /* ── EV_EFI_GPT_EVENT  (0x8000000C) ──────────────────
+       EFI_GPT_DATA: header(92) + partCount(8) + partitions(N×128) */
+    case 0x8000000C:
+        if(sz >= 100){
+            UINT64 partCount = *(UINT64*)(d+92);
+            if(partCount > 128) partCount = 128;
+            swprintf_s(lbl,511,L"GPT partition count: %I64u",partCount);
+            ADD(hEv,lbl,2,COL_DEFAULT);
+
+            /* Disk GUID is at offset 56 in the GPT header */
+            wchar_t diskGuid[64]={0}; FmtGuid(d+56,diskGuid,63);
+            swprintf_s(lbl,511,L"Disk GUID: %s",diskGuid);
+            ADD(hEv,lbl,2,COL_DEFAULT);
+
+            for(UINT64 i=0; i<partCount && 100+i*128+128<=(UINT64)sz; i++){
+                const BYTE *pe = d + 100 + i*128;
+                /* GPT partition entry: typeGuid(16)+partGuid(16)+startLBA(8)+
+                   endLBA(8)+attrs(8)+name(72 UTF-16LE) */
+                wchar_t typeGuid[64]={0}; FmtGuid(pe,typeGuid,63);
+                UINT64 startLBA = *(UINT64*)(pe+32);
+                UINT64 endLBA   = *(UINT64*)(pe+40);
+                UINT64 sectors  = endLBA >= startLBA ? endLBA-startLBA+1 : 0;
+
+                /* Friendly partition type names */
+                static const struct { const BYTE g[16]; const wchar_t *n; } pt[] = {
+                    {{0x28,0x73,0x2A,0xC1,0x1F,0xF8,0xD2,0x11,0xBA,0x4B,0x00,0xA0,0xC9,0x3E,0xC9,0x3B}, L"EFI System Partition"},
+                    {{0x16,0xE3,0xC9,0xE3,0x5C,0x0B,0xB8,0x4D,0x81,0x7D,0xF9,0x2D,0xF0,0x02,0x15,0xAE}, L"Microsoft Reserved"},
+                    {{0xA2,0xA0,0xD0,0xEB,0xE5,0xB9,0x33,0x44,0x87,0xC0,0x68,0xB6,0xB7,0x26,0x99,0xC7}, L"Basic Data"},
+                    {{0xAA,0xC8,0x08,0x58,0x8F,0x7E,0xE0,0x42,0x85,0xD2,0xE1,0xE9,0x04,0x34,0xCF,0xB3}, L"LDM Metadata"},
+                    {{0x26,0x58,0x44,0xA9,0x76,0x7B,0xCC,0x45,0xA4,0xBB,0xA4,0xBD,0x2D,0x79,0x06,0x6E}, L"Windows RE"},
+                    {{0x0F,0x88,0x9D,0xA1,0x15,0x3B,0x43,0x40,0xB5,0x48,0x02,0x2D,0x0C,0xE4,0xF7,0x4F}, L"Linux /boot"},
+                    {{0x0F,0xC6,0x3D,0xAF,0x84,0x83,0x72,0x47,0x8E,0x79,0x3D,0x69,0xD8,0x47,0x7D,0xE4}, L"Linux Data"},
+                    {{0x6D,0xFD,0x57,0x06,0xAB,0xA4,0xC4,0x43,0x84,0xE5,0x09,0x33,0xC8,0x4B,0x4F,0x4F}, L"Linux swap"},
+                };
+                const wchar_t *ptName = NULL;
+                for(int k=0;k<8;k++) if(memcmp(pe,pt[k].g,16)==0){ ptName=pt[k].n; break; }
+
+                wchar_t partName[37]={0};
+                memcpy(partName, pe+56, 36*2); partName[36]=0;
+                /* Trim null */
+                for(int t=35;t>=0&&partName[t]==0;t--) partName[t]=0;
+
+                swprintf_s(lbl,511,L"[%I64u] %s  \u2014  %s  (%I64u MB)",
+                    i,
+                    partName[0]?partName:L"(unnamed)",
+                    ptName?ptName:typeGuid,
+                    sectors/2048);
+                ADD(hEv,lbl,2,ptName?COL_HARDWARE:COL_DEFAULT);
+            }
+        }
+        break;
+
+    /* ── EV_EFI_ACTION / EV_ACTION  (0x8000000A / 0x05) ──
+       Actual format on this firmware:
+         byte[0]  = string length (char count, not including null)
+         byte[1..len] = ASCII string
+         byte[len+1]  = 0x00 null terminator
+         byte[len+2..] = optional binary tail (address/size)
+       Some firmware instead just stores a plain null-terminated ASCII
+       string with no length prefix. Handle both. */
+    case 0x8000000A:
+    case 0x00000005:{
+        if(sz == 0) break;
+        wchar_t str[512]={0};
+        DWORD strEnd = 0;  /* first byte past the string+null */
+
+        /* Try length-prefixed form: byte[0] = len, then ascii, then null */
+        BYTE prefixLen = d[0];
+        if(prefixLen > 0 && prefixLen < sz && (DWORD)prefixLen+1 < sz
+           && d[prefixLen+1] == 0x00){
+            /* Validate the chars */
+            BOOL ok = TRUE;
+            for(BYTE i = 1; i <= prefixLen; i++)
+                if(d[i] < 0x20 || d[i] >= 0x7F){ ok=FALSE; break; }
+            if(ok){
+                MultiByteToWideChar(CP_UTF8,0,(char*)(d+1),(int)prefixLen,str,511);
+                str[prefixLen]=0;
+                strEnd = prefixLen + 2;
+            }
+        }
+
+        /* Fall back to plain null-terminated ASCII */
+        if(str[0]==0 && TryAscii(d,sz,str,511)){
+            /* find the null */
+            strEnd = 0;
+            for(DWORD i=0;i<sz;i++) if(d[i]==0){strEnd=i+1;break;}
+        }
+
+        if(str[0]){
+            swprintf_s(lbl,511,L"\"%s\"",str);
+            ADD(hEv,lbl,2,COL_HARDWARE);
+            /* If there's a binary tail, show base+size */
+            DWORD tail = sz - strEnd;
+            if(strEnd > 0 && tail == 8){
+                UINT64 addr = *(UINT64*)(d+strEnd);
+                swprintf_s(lbl,511,L"Address: 0x%016I64X",addr);
+                ADD(hEv,lbl,2,COL_DEFAULT);
+            } else if(strEnd > 0 && tail == 16){
+                UINT64 base = *(UINT64*)(d+strEnd);
+                UINT64 len2 = *(UINT64*)(d+strEnd+8);
+                swprintf_s(lbl,511,L"Base:   0x%016I64X",base); ADD(hEv,lbl,2,COL_DEFAULT);
+                swprintf_s(lbl,511,L"Length: 0x%I64X (%I64u KB)",len2,len2/1024); ADD(hEv,lbl,2,COL_DEFAULT);
+            } else if(strEnd > 0 && tail > 0){
+                AddHexDump(hEv,d+strEnd,tail,L"tail: ");
+            }
+        } else {
+            /* Truly unknown — show hex */
+            AddHexDump(hEv,d,sz,L"");
+        }
+        break;
+    }
+
+    /* ── EV_SEPARATOR  (0x04) ────────────────────────────
+       A 4-byte value; 0x00000000 means no error */
+    case 0x00000004:
+        if(sz >= 4){
+            DWORD val = *(DWORD*)d;
+            swprintf_s(lbl,511,L"Value: 0x%08X%s",val,
+                val==0?L"  (success)":val==0xFFFFFFFF?L"  (error)":L"");
+            ADD(hEv,lbl,2,val==0?COL_GOOD:(val==0xFFFFFFFF?COL_BAD:COL_DEFAULT));
+        }
+        break;
+
+    /* ── EV_NO_ACTION  (0x03) ────────────────────────────
+       Variable; may contain a "Spec ID Event" header or StartupLocality */
+    case 0x00000003:
+        if(sz >= 16){
+            wchar_t str[32]={0};
+            /* Check for "Spec ID Event03" or "StartupLocality" */
+            if(sz >= 15 && memcmp(d,"Spec ID Event03",15)==0){
+                /* specVersion at offset 24+: major(1)+minor(1)+errata(1) */
+                if(sz >= 28){
+                    swprintf_s(lbl,511,L"Spec: TCG2 v%u.%u errata %u",d[24],d[25],d[26]);
+                    ADD(hEv,lbl,2,COL_HARDWARE);
+                    /* Hash algorithm list follows */
+                    DWORD numAlg = *(DWORD*)(d+24+4);
+                    DWORD off2 = 24+8;
+                    for(DWORD i=0;i<numAlg&&off2+4<=sz;i++){
+                        WORD alg  = *(WORD*)(d+off2);
+                        WORD hlen = *(WORD*)(d+off2+2);
+                        const wchar_t *an =
+                            alg==0x0004?L"SHA-1":
+                            alg==0x000B?L"SHA-256":
+                            alg==0x000C?L"SHA-384":
+                            alg==0x000D?L"SHA-512":L"?";
+                        swprintf_s(lbl,511,L"Hash alg: %s (%u bytes)",an,hlen);
+                        ADD(hEv,lbl,2,COL_DEFAULT);
+                        off2+=4;
+                    }
+                }
+            } else if(sz >= 17 && memcmp(d,"StartupLocality",15)==0){
+                BYTE loc = d[16];
+                swprintf_s(lbl,511,L"Startup locality: %u%s",loc,
+                    loc==0?L" (BIOS/firmware)":loc==3?L" (OS/pre-OS)":L"");
+                ADD(hEv,lbl,2,COL_DEFAULT);
+            }
+        }
+        break;
+
+    /* ── EV_CPU_MICROCODE  (0x09) ────────────────────────
+       UEFI_PLATFORM_FIRMWARE_BLOB: base(8) + length(8) */
+    case 0x00000009:
+        if(sz >= 16){
+            UINT64 base = *(UINT64*)d;
+            UINT64 len  = *(UINT64*)(d+8);
+            swprintf_s(lbl,511,L"Microcode base:   0x%016I64X",base); ADD(hEv,lbl,2,COL_DEFAULT);
+            swprintf_s(lbl,511,L"Microcode length: 0x%I64X (%I64u bytes)",len,len); ADD(hEv,lbl,2,COL_DEFAULT);
+        }
+        break;
+
+    /* ── EV_COMPACT_HASH  (0x0C) ─────────────────────────
+       Raw hash (often all-FF when PCR not used) — just show hex cleanly */
+    case 0x0000000C:
+        if(sz > 0){
+            wchar_t hex[128]={0};
+            DWORD show = sz < 48 ? sz : 48;
+            for(DWORD b=0;b<show;b++) swprintf_s(hex+b*2,3,L"%02X",d[b]);
+            if(sz > 48) wcscat(hex,L"\u2026");
+            swprintf_s(lbl,511,L"Hash: %s",hex);
+            ADD(hEv,lbl,2,COL_DEFAULT);
+        }
+        break;
+
+    /* ── EV_TABLE_OF_DEVICES  (0x0B) ─────────────────────
+       ACPI-style 8-byte base+length records */
+    case 0x0000000B:
+        if(sz >= 8){
+            DWORD nEntries = sz / 8;
+            for(DWORD i=0;i<nEntries&&i<8;i++){
+                UINT64 val = *(UINT64*)(d+i*8);
+                swprintf_s(lbl,511,L"Entry[%u]: 0x%016I64X",i,val);
+                ADD(hEv,lbl,2,COL_DEFAULT);
+            }
+        }
+        break;
+
+    default:
+        /* For any unhandled type with small data, try string then hex */
+        if(sz > 0 && sz <= 512){
+            wchar_t str[512]={0};
+            if(TryUtf16(d,sz,str,511)){
+                swprintf_s(lbl,511,L"Data: \"%s\"",str);
+                ADD(hEv,lbl,2,COL_DEFAULT);
+            } else if(TryAscii(d,sz,str,511)){
+                swprintf_s(lbl,511,L"Data: \"%s\"",str);
+                ADD(hEv,lbl,2,COL_DEFAULT);
+            } else if(sz <= 64){
+                AddHexDump(hEv,d,sz,L"");
+            }
+        }
+        break;
+    }
+}
+
 static void LoadTCGLog(HTREEITEM hRoot)
 {
     HTREEITEM hLog = ADD(hRoot, L"TCG Boot Event Log", 0, COL_HEADER);
@@ -1570,47 +2171,18 @@ static void LoadTCGLog(HTREEITEM hRoot)
                 hPCRNodes[pcrIdx] = ADD(hLog,lbl,0,COL_HEADER);
             }
 
-            wchar_t evLbl[256];
             const wchar_t *typeName = TcgEventTypeName(evType);
-
-            wchar_t dataBuf[256] = {0};
-            if(evSize > 0 && evSize < 512){
-                int nullOdds=0;
-                for(UINT32 i=1;i<evSize&&i<32;i+=2)
-                    if(evData[i]==0) nullOdds++;
-                BOOL utf16=(evSize>=4 && nullOdds>=(int)(evSize<32?evSize/4:4));
-                if(utf16){
-                    UINT32 chars=evSize/2; if(chars>127) chars=127;
-                    memcpy(dataBuf,evData,chars*2); dataBuf[chars]=0;
-                    for(int i=(int)chars-1;i>=0&&dataBuf[i]==0;i--) dataBuf[i]=0;
-                } else {
-                    BOOL allPrint = TRUE;
-                    for(UINT32 i=0;i<evSize&&i<64;i++)
-                        if(evData[i]==0||evData[i]>=0x7F||
-                           (evData[i]<0x20&&evData[i]!=0x0A&&evData[i]!=0x0D))
-                            {allPrint=FALSE;break;}
-                    if(allPrint && evData[0]>=0x20 && evData[0]<0x7F)
-                        MultiByteToWideChar(CP_UTF8,0,(char*)evData,
-                                            evSize>128?128:(int)evSize,dataBuf,255);
-                    else{
-                        UINT32 hex=evSize<12?evSize:12;
-                        for(UINT32 i=0;i<hex;i++)
-                            swprintf_s(dataBuf+i*3,4,L"%02X ",evData[i]);
-                        if(evSize>12) wcscat(dataBuf,L"\u2026");
-                    }
-                }
-            }
-
-            swprintf_s(evLbl,255,L"[%s]%s%s",
-                typeName,
-                dataBuf[0]?L"  ":L"",
-                dataBuf[0]?dataBuf:L"");
+            wchar_t evLbl[256];
+            swprintf_s(evLbl,255,L"[%s]",typeName);
             HTREEITEM hEv = ADD(hPCRNodes[pcrIdx],evLbl,2,COL_DEFAULT);
 
-            wchar_t hex[48]={0};
-            for(int i=0;i<20;i++) swprintf_s(hex+i*2,3,L"%02X",sha1[i]);
-            wchar_t digestLbl[64]; swprintf_s(digestLbl,63,L"SHA-1: %s",hex);
+            wchar_t hexd[48]={0};
+            for(int i=0;i<20;i++) swprintf_s(hexd+i*2,3,L"%02X",sha1[i]);
+            wchar_t digestLbl[64]; swprintf_s(digestLbl,63,L"SHA-1: %s",hexd);
             ADD(hEv,digestLbl,2,COL_DEFAULT);
+
+            /* Rich structured data */
+            if(evSize > 0) ParseEventData(hEv, evType, evData, evSize);
 
             pcrEvCount[pcrIdx]++;
             totalEvents++;
@@ -1654,65 +2226,8 @@ static void LoadTCGLog(HTREEITEM hRoot)
             }
 
             const wchar_t *typeName=TcgEventTypeName(evType);
-
-            wchar_t dataBuf[512]={0};
-            if(evType==0x80000001||evType==0x80000002||
-               evType==0x80000010){
-                if(evSize>=32){
-                    const BYTE  *guid16  = evData;
-                    UINT64       nameLen = *(UINT64*)(evData+16);
-                    if(nameLen>0 && nameLen<128 && 32+nameLen*2<=(UINT64)evSize){
-                        const wchar_t *gname=FriendlyEfiVarGuid(guid16);
-                        wchar_t varName[128]={0};
-                        memcpy(varName,evData+32,nameLen*2);
-                        swprintf_s(dataBuf,511,L"%s\\%s",
-                            gname?gname:L"?",varName);
-                    }
-                }
-            } else if(evType==0x00000005||evType==0x00000008||evType==0x8000000A){
-                if(evSize>=2 && evSize<512){
-                    BOOL utf16=FALSE;
-                    if((evSize&1)==0 && evData[0]>=0x20 && evData[0]<0x80 && evData[1]==0){
-                        int nullOdd=0;
-                        UINT32 check=evSize<64?evSize:64;
-                        for(UINT32 i=1;i<check;i+=2)
-                            if(evData[i]==0) nullOdd++;
-                        utf16=(nullOdd >= (int)(check/2)*7/10);
-                    }
-                    if(utf16){
-                        UINT32 chars=evSize/2;
-                        if(chars>255) chars=255;
-                        memcpy(dataBuf,evData,chars*2);
-                        dataBuf[chars]=0;
-                        for(int i=(int)chars-1;i>=0&&dataBuf[i]==0;i--) dataBuf[i]=0;
-                    } else {
-                        BOOL ok=TRUE;
-                        UINT32 show=evSize>200?200:evSize;
-                        for(UINT32 i=0;i<show;i++)
-                            if(evData[i]==0||evData[i]>=0x7F||evData[i]<0x20){ok=FALSE;break;}
-                        if(ok && evData[0]>=0x20 && evData[0]<0x7F)
-                            MultiByteToWideChar(CP_UTF8,0,(char*)evData,(int)show,dataBuf,511);
-                        else{
-                            UINT32 h=evSize<16?evSize:16;
-                            for(UINT32 i=0;i<h;i++) swprintf_s(dataBuf+i*3,4,L"%02X ",evData[i]);
-                            if(evSize>16) wcscat(dataBuf,L"...");
-                        }
-                    }
-                }
-            } else if(evSize>0&&evSize<256){
-                BOOL allPrint=TRUE;
-                for(UINT32 i=0;i<evSize&&i<64;i++)
-                    if(evData[i]==0||evData[i]>=0x7F||evData[i]<0x20){allPrint=FALSE;break;}
-                if(allPrint && evData[0]>=0x20 && evData[0]<0x7F)
-                    MultiByteToWideChar(CP_UTF8,0,(char*)evData,
-                                        evSize>128?128:(int)evSize,dataBuf,511);
-            }
-
             wchar_t evLbl[512];
-            swprintf_s(evLbl,511,L"[%s]%s%s",
-                typeName,
-                dataBuf[0]?L"  ":L"",
-                dataBuf[0]?dataBuf:L"");
+            swprintf_s(evLbl,511,L"[%s]",typeName);
             HTREEITEM hEv=ADD(hPCRNodes[pcrIdx],evLbl,2,COL_DEFAULT);
 
             for(DWORD d=0;d<nDigests;d++){
@@ -1728,6 +2243,9 @@ static void LoadTCGLog(HTREEITEM hRoot)
                 swprintf_s(dl,199,L"%s: %s",aname,hex);
                 ADD(hEv,dl,2,COL_DEFAULT);
             }
+
+            /* Rich structured data */
+            if(evSize > 0) ParseEventData(hEv, evType, evData, evSize);
 
             pcrEvCount[pcrIdx]++;
             totalEvents++;
